@@ -1,0 +1,10 @@
+{
+  "lsp": {
+    "elixir-ls": {
+      "binary": {
+        "path": "/opt/homebrew/bin/mise",
+        "arguments": ["exec", "--", "/opt/homebrew/bin/elixir-ls"]
+      }
+    }
+  }
+}

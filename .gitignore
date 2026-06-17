@@ -1,0 +1,22 @@
+# Elixir
+/_build/
+/cover/
+/deps/
+/doc/
+/.elixir_ls/
+erl_crash.dump
+/exfuse-*/
+/exfuse-*.tar
+
+# Rust
+/rust/target/
+/priv/exfuse_port
+
+# macOS
+.DS_Store
+
+# Editor/local
+/.zed/*
+!/.zed/
+!/.zed/settings.json
+/.vscode/
