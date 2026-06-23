@@ -131,16 +131,18 @@ defmodule Exfuse do
       [] ->
         {:error, :not_mounted}
 
-      [{pid, _status}] ->
-        try do
-          :ok = Exfuse.Server.stop(pid)
-        catch
-          :exit, {:noproc, _} -> :ok
-          :exit, :normal -> :ok
-        end
-
-        {:ok, pid}
+      matches ->
+        pids = Enum.map(matches, fn {pid, _status} -> pid end)
+        Enum.each(pids, &stop_server/1)
+        {:ok, List.first(pids)}
     end
+  end
+
+  defp stop_server(pid) do
+    :ok = Exfuse.Server.stop(pid)
+  catch
+    :exit, {:noproc, _} -> :ok
+    :exit, :normal -> :ok
   end
 
   @doc """

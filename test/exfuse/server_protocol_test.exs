@@ -22,6 +22,10 @@ defmodule Exfuse.ServerProtocolTest do
     def handle_event(_op, _event, socket), do: {:error, :enosys, socket}
   end
 
+  defmodule InitFs do
+    def exfuse_init(_mount_point, state), do: {:ok, state}
+  end
+
   defmodule FineGrainedFs do
     alias Exfuse.Socket
 
@@ -122,6 +126,43 @@ defmodule Exfuse.ServerProtocolTest do
 
     assert state.fs_state == :seen
     assert_receive {^ref, <<@magiccookie::32, @request_read::32, 0::32, "ctx">>}
+  end
+
+  test "umount stops duplicate FSKit backend servers for the same mount point" do
+    mount_point =
+      Path.join(System.tmp_dir!(), "exfuse-fskit-duplicate-#{System.unique_integer([:positive])}")
+
+    File.mkdir_p!(mount_point)
+    on_exit(fn -> File.rm_rf(mount_point) end)
+
+    {:ok, first} =
+      Exfuse.MountSup.start_child(mount_point, InitFs, :first,
+        backend: :fskit,
+        wire_port: free_port(),
+        fskit_resource: %{owned: false}
+      )
+
+    {:ok, second} =
+      Exfuse.MountSup.start_child(mount_point, InitFs, :second,
+        backend: :fskit,
+        wire_port: free_port(),
+        fskit_resource: %{owned: false}
+      )
+
+    assert 2 ==
+             Exfuse.list()
+             |> Enum.count(fn
+               {_pid, {^mount_point, InitFs, _state, nil}} -> true
+               _other -> false
+             end)
+
+    first_ref = Process.monitor(first)
+    second_ref = Process.monitor(second)
+
+    assert {:ok, stopped} = Exfuse.umount(mount_point)
+    assert stopped in [first, second]
+    assert_receive {:DOWN, ^first_ref, :process, ^first, :normal}
+    assert_receive {:DOWN, ^second_ref, :process, ^second, :normal}
   end
 
   test "dispatches write requests" do
@@ -293,6 +334,13 @@ defmodule Exfuse.ServerProtocolTest do
   defp open_echo_port do
     cat = System.find_executable("cat")
     Port.open({:spawn_executable, cat}, [{:packet, 4}, :binary])
+  end
+
+  defp free_port do
+    {:ok, socket} = :gen_tcp.listen(0, [:binary, active: false])
+    {:ok, {_address, port}} = :inet.sockname(socket)
+    :ok = :gen_tcp.close(socket)
+    port
   end
 
   defp close_port(port) do
