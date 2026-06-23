@@ -18,16 +18,97 @@ defmodule Exfuse do
   inspect for improved understanding of how a filesystem is implemented.
   """
 
-  @spec mount(String.t(), module, term) :: {:ok, pid}
+  @spec mount(String.t(), module, term, keyword) :: {:ok, pid} | {:error, term}
 
-  def mount(mount_point, fs_mod, fs_state) do
-    case Exfuse.MountSup.start_child(mount_point, fs_mod, fs_state) do
+  def mount(mount_point, fs_mod, fs_state, opts \\ []) do
+    backend = Keyword.get(opts, :backend, backend())
+
+    case prepare_backend(mount_point, backend, opts) do
+      {:ok, backend_opts} ->
+        start_mount(mount_point, fs_mod, fs_state, backend, opts, backend_opts)
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp start_mount(mount_point, fs_mod, fs_state, backend, opts, backend_opts) do
+    case Exfuse.MountSup.start_child(
+           mount_point,
+           fs_mod,
+           fs_state,
+           Keyword.merge([backend: backend], backend_opts)
+         ) do
       {:ok, pid} ->
-        wait_until_mounted(mount_point)
-        {:ok, pid}
+        case mount_backend(mount_point, backend, opts, backend_opts) do
+          :ok ->
+            {:ok, pid}
+
+          {:error, reason} ->
+            _ = Exfuse.Server.stop(pid)
+            {:error, reason}
+        end
 
       other ->
         other
+    end
+  end
+
+  defp prepare_backend(_mount_point, :fuse, _opts), do: {:ok, []}
+
+  defp prepare_backend(_mount_point, :fskit, opts) do
+    cond do
+      resource = Keyword.get(opts, :resource) ->
+        {:ok, fskit_resource: %{device: resource, image: nil, owned: false}}
+
+      true ->
+        create_fskit_resource()
+    end
+  end
+
+  defp mount_backend(mount_point, :fuse, _opts, _backend_opts) do
+    wait_until_mounted(mount_point)
+    :ok
+  end
+
+  defp mount_backend(mount_point, :fskit, _opts, backend_opts) do
+    resource = backend_opts |> Keyword.fetch!(:fskit_resource) |> Map.fetch!(:device)
+    File.mkdir_p!(mount_point)
+
+    case System.cmd("mount", ["-F", "-t", "exfuse", resource, mount_point],
+           stderr_to_stdout: true
+         ) do
+      {_out, 0} ->
+        wait_until_mounted(mount_point)
+        :ok
+
+      {out, status} ->
+        {:error, {:fskit_mount_failed, status, String.trim(out)}}
+    end
+  end
+
+  defp create_fskit_resource do
+    image = Path.join(System.tmp_dir!(), "exfuse-#{System.unique_integer([:positive])}.dmg")
+
+    with {_, 0} <- System.cmd("mkfile", ["-n", "1m", image], stderr_to_stdout: true),
+         {device, 0} <-
+           System.cmd(
+             "hdiutil",
+             ["attach", "-imagekey", "diskimage-class=CRawDiskImage", "-nomount", image],
+             stderr_to_stdout: true
+           ) do
+      {:ok, fskit_resource: %{device: String.trim(device), image: image, owned: true}}
+    else
+      {out, status} ->
+        _ = File.rm(image)
+        {:error, {:fskit_resource_failed, status, String.trim(out)}}
+    end
+  end
+
+  defp backend do
+    case System.get_env("EXFUSE_BACKEND") do
+      "fskit" -> :fskit
+      _ -> :fuse
     end
   end
 

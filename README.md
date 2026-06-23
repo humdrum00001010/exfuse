@@ -1,11 +1,65 @@
 # exfuse
 
-Elixir filesystem routing over FUSE.
+Elixir filesystem routing over native user-space filesystem backends.
 
 The native bridge is the Rust port `exfuse_port` under `rust`. Mix builds it
 and copies it to `priv/exfuse_port`. It is not a NIF.
 
 Set `EXFUSE_PORT=/path/to/exfuse_port` to override the port executable.
+
+## macOS backend migration
+
+The original macOS backend uses macFUSE through the Rust port. Newer macOS
+releases provide FSKit, which avoids the reduced-security boot-mode setup that
+macFUSE requires. The FSKit migration lives under `native/fskit`:
+
+- `ExfuseFSKitExtension.swift` is the FSKit `UnaryFileSystemExtension`
+  entrypoint.
+- `ExfuseVolume.swift` maps FSKit volume operations onto the existing exfuse
+  filesystem operation set.
+- `ExfuseWire.swift` speaks the existing exfuse framed request protocol over a
+  localhost socket, so Elixir filesystem modules do not need a new callback API.
+- `Exfuse.WireListener` receives that same framed protocol over TCP and
+  dispatches it through `Exfuse.Server`.
+
+Check SDK/API compatibility with:
+
+```sh
+mix exfuse.fskit.check
+```
+
+Build a local host app with the embedded FSKit `.appex`:
+
+```sh
+mix exfuse.fskit.bundle
+```
+
+Install and register the app extension for local testing:
+
+```sh
+mix exfuse.fskit.install
+```
+
+macOS still requires the user approval toggle after registration:
+
+```text
+System Settings > General > Login Items & Extensions > File System Extensions
+```
+
+Enable `exfuse` there. If that toggle is still off, FSKit rejects the mount with
+`Module org.exfuse.fskit.extension is disabled!`.
+
+After approval, choose the FSKit backend explicitly:
+
+```elixir
+Exfuse.mount("/Volumes/DocsFs", DocsFs, state, backend: :fskit)
+```
+
+or make FSKit the process default:
+
+```sh
+EXFUSE_BACKEND=fskit mix run
+```
 
 ## Build
 

@@ -103,6 +103,27 @@ defmodule Exfuse.ServerProtocolTest do
     assert_receive {^port, {:data, <<@magiccookie::32, @request_read::32, 0::32, "ctx">>}}
   end
 
+  test "dispatches framed wire packets without an Erlang Port reply target" do
+    port = open_echo_port()
+    on_exit(fn -> close_port(port) end)
+
+    request =
+      <<@magiccookie::32, @request_read::32, ctx()::binary,
+        read_payload("/ctx", 0, 101, 2, 3)::binary>>
+
+    ref = make_ref()
+
+    assert {:noreply, state} =
+             Exfuse.Server.handle_call(
+               {:wire_packet, request},
+               {self(), ref},
+               server_state(SocketFs, port)
+             )
+
+    assert state.fs_state == :seen
+    assert_receive {^ref, <<@magiccookie::32, @request_read::32, 0::32, "ctx">>}
+  end
+
   test "dispatches write requests" do
     port = open_echo_port()
     on_exit(fn -> close_port(port) end)

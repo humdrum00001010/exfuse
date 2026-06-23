@@ -27,12 +27,12 @@ defmodule Exfuse.MountSup do
   for more details.
   """
 
-  @spec start_child(String.t(), module, term) :: {:ok, pid} | {:error, term}
+  @spec start_child(String.t(), module, term, keyword) :: {:ok, pid} | {:error, term}
 
-  def start_child(mount_point, fs_mod, fs_state) do
+  def start_child(mount_point, fs_mod, fs_state, opts \\ []) do
     child_spec = %{
       id: Exfuse.Server,
-      start: {Exfuse.Server, :start_link, [mount_point, fs_mod, fs_state]},
+      start: {Exfuse.Server, :start_link, [mount_point, fs_mod, fs_state, opts]},
       restart: :transient
     }
 

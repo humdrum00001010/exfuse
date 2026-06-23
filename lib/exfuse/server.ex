@@ -13,8 +13,12 @@ defmodule Exfuse.Server do
             fs_state: nil,
             socket: nil,
             phase: :init,
+            backend: :fuse,
             port: nil,
-            port_os_pid: nil
+            port_os_pid: nil,
+            listener: nil,
+            fskit_resource: nil,
+            reply_to: nil
 
   @doc """
   Called by the `Exfuse.MountSup` supervisor, `start_link` starts an FS
@@ -23,8 +27,8 @@ defmodule Exfuse.Server do
 
   @spec start_link(String.t(), module, term) :: {:ok, pid} | {:error, term}
 
-  def start_link(mount_point, fs_mod, fs_opts) do
-    GenServer.start_link(__MODULE__, [mount_point, fs_mod, fs_opts], [])
+  def start_link(mount_point, fs_mod, fs_opts, opts \\ []) do
+    GenServer.start_link(__MODULE__, [mount_point, fs_mod, fs_opts, opts], [])
   end
 
   @doc """
@@ -59,7 +63,19 @@ defmodule Exfuse.Server do
   end
 
   @doc false
-  def init([mount_point, fs_mod, fs_opts]) do
+  def dispatch(pid, packet, timeout \\ 5_000) when is_binary(packet) do
+    GenServer.call(pid, {:wire_packet, packet}, timeout)
+  end
+
+  @doc false
+  def init([mount_point, fs_mod, fs_opts, opts]) do
+    case Keyword.get(opts, :backend, :fuse) do
+      :fskit -> init_fskit(mount_point, fs_mod, fs_opts, opts)
+      :fuse -> init_fuse(mount_point, fs_mod, fs_opts)
+    end
+  end
+
+  defp init_fuse(mount_point, fs_mod, fs_opts) do
     with {:ok, fs_state} <- fs_mod.exfuse_init(mount_point, fs_opts),
          {:ok, port_path} <- Exfuse.App.find_port!() do
       port =
@@ -75,6 +91,7 @@ defmodule Exfuse.Server do
         fs_mod: fs_mod,
         fs_state: fs_state,
         socket: socket,
+        backend: :fuse,
         port: port
       }
 
@@ -87,10 +104,35 @@ defmodule Exfuse.Server do
     end
   end
 
+  defp init_fskit(mount_point, fs_mod, fs_opts, opts) do
+    port = Keyword.get(opts, :wire_port, 35_368)
+
+    with {:ok, fs_state} <- fs_mod.exfuse_init(mount_point, fs_opts),
+         {:ok, listener} <- Exfuse.WireListener.start_link(server: self(), port: port) do
+      socket = Socket.new(mount_point, fs_state)
+
+      state = %__MODULE__{
+        mount_point: mount_point,
+        fs_mod: fs_mod,
+        fs_state: fs_state,
+        socket: socket,
+        phase: :ready,
+        backend: :fskit,
+        listener: listener,
+        fskit_resource: Keyword.get(opts, :fskit_resource)
+      }
+
+      {:ok, state}
+    else
+      {:error, reason} -> {:stop, reason}
+    end
+  end
+
   def terminate(
         _reason,
         %__MODULE__{
-          port_os_pid: nil
+          port_os_pid: nil,
+          listener: nil
         } = _state
       ) do
     :undefined
@@ -99,6 +141,11 @@ defmodule Exfuse.Server do
   def terminate(_reason, state) do
     server_stop_port(state)
     :undefined
+  end
+
+  defp port_tx(data, %__MODULE__{reply_to: {:genserver_client, from}} = state) do
+    GenServer.reply(from, <<@magiccookie::size(32), data::binary>>)
+    state
   end
 
   defp port_tx(data, %__MODULE__{port: port} = state) do
@@ -525,6 +572,22 @@ defmodule Exfuse.Server do
     {:reply, {:ok, status}, state}
   end
 
+  def handle_call({:wire_packet, packet}, from, %__MODULE__{} = state) do
+    state = %{state | reply_to: {:genserver_client, from}}
+
+    case handle_info({state.port, {:data, packet}}, state) do
+      {:noreply, state} -> {:noreply, %{state | reply_to: nil}}
+      {:stop, reason, state} -> {:stop, reason, %{state | reply_to: nil}}
+    end
+  end
+
+  defp server_stop_port(%__MODULE__{backend: :fskit, listener: listener} = state) do
+    if is_pid(listener), do: GenServer.stop(listener)
+
+    cleanup_fskit_resource(state.fskit_resource)
+    {:unmounted, %{state | listener: nil, fskit_resource: nil}}
+  end
+
   defp server_stop_port(%__MODULE__{port_os_pid: nil} = state) do
     {:unmounted, state}
   end
@@ -544,6 +607,19 @@ defmodule Exfuse.Server do
       end
     end
   end
+
+  defp cleanup_fskit_resource(nil), do: :ok
+
+  defp cleanup_fskit_resource(%{owned: true, device: device, image: image}) do
+    if is_binary(device) and device != "" do
+      System.cmd("hdiutil", ["detach", device], stderr_to_stdout: true)
+    end
+
+    if is_binary(image), do: File.rm(image)
+    :ok
+  end
+
+  defp cleanup_fskit_resource(_resource), do: :ok
 
   defp kill_port(port_os_pid) do
     pid = "#{port_os_pid}"

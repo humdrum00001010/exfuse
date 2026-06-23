@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "https://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleDevelopmentRegion</key>
+  <string>en</string>
+  <key>CFBundleDisplayName</key>
+  <string>Exfuse FSKit</string>
+  <key>CFBundleExecutable</key>
+  <string>ExfuseFSKitHost</string>
+  <key>CFBundleIdentifier</key>
+  <string>org.exfuse.fskit</string>
+  <key>CFBundleInfoDictionaryVersion</key>
+  <string>6.0</string>
+  <key>CFBundleName</key>
+  <string>ExfuseFSKit</string>
+  <key>CFBundlePackageType</key>
+  <string>APPL</string>
+  <key>CFBundleShortVersionString</key>
+  <string>0.1.0</string>
+  <key>CFBundleSupportedPlatforms</key>
+  <array>
+    <string>MacOSX</string>
+  </array>
+  <key>CFBundleVersion</key>
+  <string>1</string>
+  <key>LSMinimumSystemVersion</key>
+  <string>15.4</string>
+  <key>LSUIElement</key>
+  <true/>
+  <key>NSSystemExtensionUsageDescription</key>
+  <string>Exfuse uses an FSKit extension to mount Elixir-backed user-space file systems.</string>
+  <key>NSSystemExtensionUsageDescriptionKey</key>
+  <string>Exfuse uses an FSKit extension to mount Elixir-backed user-space file systems.</string>
+</dict>
+</plist>

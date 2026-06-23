@@ -34,7 +34,7 @@ defmodule Exfuse.MixProject do
   end
 
   defp description do
-    "Elixir filesystem routing over FUSE with a Rust port bridge"
+    "Elixir filesystem routing over native user-space filesystem backends"
   end
 
   defp source_url do
@@ -58,6 +58,7 @@ defmodule Exfuse.MixProject do
         "LICENSE",
         "lib",
         "mix.exs",
+        "native/fskit",
         "README.md",
         "rust/Cargo.lock",
         "rust/Cargo.toml",
