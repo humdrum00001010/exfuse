@@ -610,7 +610,7 @@ unsafe extern "C" fn fuse_readdir(
     path: *const c_char,
     buf: *mut c_void,
     filler: FuseFillDir,
-    _offset: libc::off_t,
+    offset: libc::off_t,
     _fi: *mut FuseFileInfo,
 ) -> c_int {
     let Some(path) = path_to_str(path) else {
@@ -622,18 +622,21 @@ unsafe extern "C" fn fuse_readdir(
 
     match with_port(|port| port.readdir(path)) {
         Ok(entries) => {
-            let dot = CString::new(".").unwrap();
-            let dotdot = CString::new("..").unwrap();
+            let start = offset.max(0) as usize;
 
-            unsafe {
-                filler(buf, dot.as_ptr(), ptr::null(), 0);
-                filler(buf, dotdot.as_ptr(), ptr::null(), 0);
-            }
-
-            for entry in entries {
+            for (index, entry) in [".", ".."]
+                .iter()
+                .copied()
+                .chain(entries.iter().map(String::as_str))
+                .enumerate()
+                .skip(start)
+            {
                 if let Ok(name) = CString::new(entry) {
+                    let next_offset = (index + 1) as libc::off_t;
                     unsafe {
-                        filler(buf, name.as_ptr(), ptr::null(), 0);
+                        if filler(buf, name.as_ptr(), ptr::null(), next_offset) != 0 {
+                            break;
+                        }
                     }
                 }
             }

@@ -512,6 +512,9 @@ defmodule ExfuseTest do
     def handle_event(:getattr, %{path: "/"}, socket),
       do: {:reply, {0o0755, @attr_dir, 0}, socket}
 
+    def handle_event(:getattr, %{path: path}, socket) when path in ["/aaa", "/bbb"],
+      do: {:reply, {0o0644, @attr_file, 0}, socket}
+
     def handle_event(:getattr, _event, socket), do: {:error, :enoent, socket}
     def handle_event(_op, _event, socket), do: {:error, :enoent, socket}
   end
@@ -685,6 +688,14 @@ defmodule ExfuseTest do
     test "FS implementation represented to OS (files returned)", %{mp: mp} do
       assert {:ok, ls_files} = File.ls(mp)
       assert Enum.sort(ls_files) == ["aaa", "bbb"]
+    end
+
+    test "FS implementation represented to native ls", %{mp: mp} do
+      assert {out, 0} = System.cmd("ls", ["-1", mp], stderr_to_stdout: true)
+
+      assert out
+             |> String.split("\n", trim: true)
+             |> Enum.sort() == ["aaa", "bbb"]
     end
   end
 
