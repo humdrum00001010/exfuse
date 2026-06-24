@@ -1,12 +1,21 @@
 defmodule Mix.Tasks.Exfuse.Fskit.Bundle do
   use Mix.Task
 
+  alias Exfuse.FSKit.Signing
+
   @shortdoc "Builds the local macOS FSKit host app bundle"
 
   @moduledoc """
   Builds a local FSKit host app bundle with the embedded exfuse FSKit extension.
 
   The default output path is `_build/fskit/ExfuseFSKit.app`.
+
+  By default, this task refuses ad-hoc signing because macOS kills FSKit
+  extensions that carry the restricted `com.apple.developer.fskit.fsmodule`
+  entitlement without a trusted code signature. Pass `--sign "Apple Development:
+  Name (TEAMID)"`, set `EXFUSE_CODESIGN_IDENTITY`, or install an Apple code
+  signing identity that the task can auto-select. `--allow-adhoc` is only for
+  compile/package checks; that bundle will not mount through FSKit.
   """
 
   @impl true
@@ -14,14 +23,19 @@ defmodule Mix.Tasks.Exfuse.Fskit.Bundle do
     if :os.type() == {:unix, :darwin} do
       {opts, _rest, _invalid} =
         OptionParser.parse(args,
-          strict: [output: :string, sign: :string, no_sign: :boolean],
+          strict: [
+            output: :string,
+            sign: :string,
+            no_sign: :boolean,
+            allow_adhoc: :boolean
+          ],
           aliases: [o: :output]
         )
 
       root = File.cwd!()
       output = Path.expand(Keyword.get(opts, :output, "_build/fskit/ExfuseFSKit.app"), root)
       sign? = not Keyword.get(opts, :no_sign, false)
-      identity = Keyword.get(opts, :sign, System.get_env("EXFUSE_CODESIGN_IDENTITY", "-"))
+      identity = if sign?, do: identity!(opts), else: nil
 
       build_bundle(root, output)
 
@@ -113,6 +127,48 @@ defmodule Mix.Tasks.Exfuse.Fskit.Bundle do
         Mix.raise("codesign failed with status #{status}\n#{text}")
     end
   end
+
+  defp identity!(opts) do
+    case Signing.resolve_identity(Keyword.get(opts, :sign),
+           allow_adhoc: Keyword.get(opts, :allow_adhoc, false)
+         ) do
+      {:ok, identity} ->
+        identity
+
+      {:error, reason} ->
+        Mix.raise(identity_error(reason))
+    end
+  end
+
+  defp identity_error(:adhoc_not_allowed) do
+    """
+    FSKit bundles cannot be ad-hoc signed by default.
+    Use --sign "Apple Development: Name (TEAMID)" or set EXFUSE_CODESIGN_IDENTITY.
+    Pass --allow-adhoc only for non-runnable compile/package checks.
+    """
+  end
+
+  defp identity_error(:no_codesign_identity) do
+    """
+    No valid code-signing identities were found.
+    Install an Apple Development or Developer ID Application certificate in Keychain,
+    or pass --allow-adhoc for a non-runnable build.
+    """
+  end
+
+  defp identity_error(:no_preferred_codesign_identity) do
+    """
+    Valid code-signing identities exist, but none look like Apple Development,
+    Mac Developer, or Developer ID Application. Pass the exact identity with --sign
+    if you intend to use a different trusted signer.
+    """
+  end
+
+  defp identity_error({:security_find_identity_failed, status, output}) do
+    "security find-identity failed with status #{status}\n#{output}"
+  end
+
+  defp identity_error(reason), do: "could not resolve FSKit signing identity: #{inspect(reason)}"
 
   defp swiftc! do
     [

@@ -28,16 +28,39 @@ Check SDK/API compatibility with:
 mix exfuse.fskit.check
 ```
 
-Build a local host app with the embedded FSKit `.appex`:
+Build a local host app with the embedded FSKit `.appex`. Because the FSKit
+module entitlement is restricted, the runnable bundle must be signed with a
+trusted Apple code-signing identity (`Apple Development`, `Mac Developer`, or
+`Developer ID Application`). The task auto-selects one from Keychain when
+available:
 
 ```sh
 mix exfuse.fskit.bundle
 ```
 
-Install and register the app extension for local testing:
+You can also pass the identity explicitly:
 
 ```sh
-mix exfuse.fskit.install
+mix exfuse.fskit.bundle --sign "Apple Development: Your Name (TEAMID)"
+```
+
+For compile/package checks only, opt into a non-runnable ad-hoc bundle:
+
+```sh
+mix exfuse.fskit.bundle --allow-adhoc
+```
+
+Build, sign, install, register, and elect the app extension for local testing
+in one command:
+
+```sh
+mix exfuse.fskit.install --build --sign "Apple Development: Your Name (TEAMID)"
+```
+
+or, when a preferred Apple identity is already in Keychain:
+
+```sh
+mix exfuse.fskit.install --build
 ```
 
 macOS still requires the user approval toggle after registration:
