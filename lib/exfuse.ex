@@ -33,11 +33,16 @@ defmodule Exfuse do
   end
 
   defp start_mount(mount_point, fs_mod, fs_state, backend, opts, backend_opts) do
+    server_opts =
+      opts
+      |> Keyword.merge(backend_opts)
+      |> Keyword.put(:backend, backend)
+
     case Exfuse.MountSup.start_child(
            mount_point,
            fs_mod,
            fs_state,
-           Keyword.merge([backend: backend], backend_opts)
+           server_opts
          ) do
       {:ok, pid} ->
         case mount_backend(mount_point, backend, opts, backend_opts) do
@@ -45,7 +50,7 @@ defmodule Exfuse do
             {:ok, pid}
 
           {:error, reason} ->
-            _ = Exfuse.Server.stop(pid)
+            stop_mount_server(pid)
             {:error, reason}
         end
 
@@ -66,25 +71,97 @@ defmodule Exfuse do
     end
   end
 
+  defp stop_mount_server(pid) do
+    ref = Process.monitor(pid)
+    _ = Exfuse.Server.stop(pid)
+
+    receive do
+      {:DOWN, ^ref, :process, ^pid, _reason} -> :ok
+    after
+      5_000 -> Process.demonitor(ref, [:flush])
+    end
+  catch
+    :exit, {:noproc, _} -> :ok
+    :exit, :normal -> :ok
+  end
+
   defp mount_backend(mount_point, :fuse, _opts, _backend_opts) do
     wait_until_mounted(mount_point)
     :ok
   end
 
-  defp mount_backend(mount_point, :fskit, _opts, backend_opts) do
+  defp mount_backend(mount_point, :fskit, opts, backend_opts) do
     resource = backend_opts |> Keyword.fetch!(:fskit_resource) |> Map.fetch!(:device)
     File.mkdir_p!(mount_point)
 
-    case System.cmd("mount", ["-F", "-t", "exfuse", resource, mount_point],
-           stderr_to_stdout: true
-         ) do
+    command = mount_command(opts)
+    args = ["-F", "-t", "exfuse", resource, mount_point]
+    timeout = Keyword.get(opts, :mount_timeout, 15_000)
+
+    case run_command(command, args, timeout) do
       {_out, 0} ->
         wait_until_mounted(mount_point)
         :ok
 
+      {:timeout, out} ->
+        {:error, {:fskit_mount_timeout, timeout, String.trim(out)}}
+
+      {:error, reason} ->
+        {:error, {:fskit_mount_command_failed, reason}}
+
       {out, status} ->
         {:error, {:fskit_mount_failed, status, String.trim(out)}}
     end
+  end
+
+  defp mount_command(opts) do
+    command = Keyword.get(opts, :mount_command, "mount")
+
+    cond do
+      Path.type(command) == :absolute -> command
+      executable = System.find_executable(command) -> executable
+      true -> command
+    end
+  end
+
+  defp run_command(command, args, timeout) do
+    port =
+      Port.open({:spawn_executable, command}, [
+        :binary,
+        :exit_status,
+        :stderr_to_stdout,
+        {:args, args}
+      ])
+
+    collect_command(port, [], System.monotonic_time(:millisecond) + timeout)
+  rescue
+    error -> {:error, Exception.message(error)}
+  catch
+    kind, reason -> {:error, {kind, reason}}
+  end
+
+  defp collect_command(port, chunks, deadline) do
+    remaining = max(deadline - System.monotonic_time(:millisecond), 0)
+
+    receive do
+      {^port, {:data, data}} ->
+        collect_command(port, [data | chunks], deadline)
+
+      {^port, {:exit_status, status}} ->
+        {chunks |> Enum.reverse() |> IO.iodata_to_binary(), status}
+    after
+      remaining ->
+        close_command_port(port)
+        {:timeout, chunks |> Enum.reverse() |> IO.iodata_to_binary()}
+    end
+  end
+
+  defp close_command_port(port) do
+    Port.close(port)
+  rescue
+    ArgumentError -> :ok
+  catch
+    :error, :badarg -> :ok
   end
 
   defp create_fskit_resource do

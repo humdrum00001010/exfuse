@@ -165,6 +165,32 @@ defmodule Exfuse.ServerProtocolTest do
     assert_receive {:DOWN, ^second_ref, :process, ^second, :normal}
   end
 
+  test "FSKit mount command timeout stops the backend server" do
+    mount_point =
+      Path.join(System.tmp_dir!(), "exfuse-fskit-timeout-#{System.unique_integer([:positive])}")
+
+    File.mkdir_p!(mount_point)
+    script = Path.join(mount_point, "slow_mount")
+    File.write!(script, "#!/bin/sh\nsleep 10\n")
+    File.chmod!(script, 0o755)
+
+    on_exit(fn -> File.rm_rf(mount_point) end)
+
+    assert {:error, {:fskit_mount_timeout, 50, ""}} =
+             Exfuse.mount(mount_point, InitFs, :state,
+               backend: :fskit,
+               resource: "/dev/null",
+               mount_command: script,
+               mount_timeout: 50,
+               wire_port: free_port()
+             )
+
+    refute Enum.any?(Exfuse.list(), fn
+             {_pid, {^mount_point, InitFs, _state, nil}} -> true
+             _other -> false
+           end)
+  end
+
   test "dispatches write requests" do
     port = open_echo_port()
     on_exit(fn -> close_port(port) end)
