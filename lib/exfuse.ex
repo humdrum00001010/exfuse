@@ -151,17 +151,36 @@ defmodule Exfuse do
         {chunks |> Enum.reverse() |> IO.iodata_to_binary(), status}
     after
       remaining ->
-        close_command_port(port)
+        kill_command_port(port)
         {:timeout, chunks |> Enum.reverse() |> IO.iodata_to_binary()}
     end
   end
 
-  defp close_command_port(port) do
+  defp kill_command_port(port) do
+    case Port.info(port, :os_pid) do
+      {:os_pid, pid} when is_integer(pid) ->
+        kill_command_pid(pid)
+
+      _ ->
+        :ok
+    end
+
     Port.close(port)
   rescue
     ArgumentError -> :ok
   catch
     :error, :badarg -> :ok
+  end
+
+  defp kill_command_pid(pid) do
+    pid = "#{pid}"
+    System.cmd("kill", [pid], stderr_to_stdout: true)
+    Process.sleep(100)
+
+    case System.cmd("kill", ["-0", pid], stderr_to_stdout: true) do
+      {_, 0} -> System.cmd("kill", ["-9", pid], stderr_to_stdout: true)
+      _ -> :ok
+    end
   end
 
   defp create_fskit_resource do
