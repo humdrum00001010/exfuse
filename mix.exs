@@ -131,5 +131,20 @@ defmodule Mix.Tasks.Compile.ExfuseRust do
     File.mkdir_p!(Path.dirname(target))
     File.cp!(source, target)
     File.chmod!(target, 0o755)
+    maybe_codesign_port(target)
+  end
+
+  defp maybe_codesign_port(target) do
+    if :os.type() == {:unix, :darwin} do
+      codesign = System.find_executable("codesign") || Mix.raise("codesign not found")
+
+      case System.cmd(codesign, ["--force", "--sign", "-", target], stderr_to_stdout: true) do
+        {_output, 0} ->
+          :ok
+
+        {output, status} ->
+          Mix.raise("codesign failed for #{target} with status #{status}\n#{output}")
+      end
+    end
   end
 end
