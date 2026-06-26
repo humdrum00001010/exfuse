@@ -4,9 +4,11 @@ use std::ffi::{CStr, CString};
 use std::io::{self, Read, Write};
 use std::mem;
 use std::os::raw::{c_char, c_int, c_uint, c_ulong, c_void};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::ptr;
 use std::sync::{Mutex, OnceLock};
+use std::thread;
+use std::time::Duration;
 
 const MAGIC: u32 = 0xC021_55AC;
 
@@ -275,6 +277,12 @@ fn run() -> io::Result<()> {
     let mount_point = mount_point_from_args()?;
     let _ = PORT.set(Mutex::new(Port::new()));
 
+    // `fuse_main_real` below blocks this thread in the libfuse session loop, which
+    // only wakes for KERNEL filesystem ops — never for the BEAM's death. So a hard
+    // BEAM exit (crash / `kill -9`) would otherwise leave this process parked here,
+    // holding the mount forever (an orphaned `exfuse_port@macfuse0`). Watch for it.
+    spawn_parent_death_watchdog(mount_point.clone());
+
     let mut args = [
         CString::new("exfuse_port").unwrap(),
         CString::new("-f").unwrap(),
@@ -301,6 +309,61 @@ fn run() -> io::Result<()> {
     } else {
         Err(io::Error::from_raw_os_error(result.abs()))
     }
+}
+
+/// How often the watchdog checks whether the owning BEAM is still our parent.
+const PARENT_WATCH_INTERVAL: Duration = Duration::from_millis(1000);
+
+/// We are orphaned once our parent pid changes: when the BEAM (our spawner,
+/// `erl_child_setup`) dies, the kernel reparents us to launchd/init or a
+/// subreaper, so any pid other than the one we started under means the owner
+/// is gone.
+fn orphaned(original_ppid: i32, current_ppid: i32) -> bool {
+    current_ppid != original_ppid
+}
+
+/// Block, polling `current_ppid()` every `interval`, until [`orphaned`] is true,
+/// then run `on_orphan`. Pure (it performs no syscalls itself) so the loop can be
+/// driven deterministically in tests.
+fn watch_parent(
+    original: i32,
+    mut current_ppid: impl FnMut() -> i32,
+    on_orphan: impl FnOnce(),
+    interval: Duration,
+) {
+    while !orphaned(original, current_ppid()) {
+        thread::sleep(interval);
+    }
+    on_orphan();
+}
+
+/// Spawn the parent-death watchdog. On the BEAM's death it tears the mount down so
+/// the mount never outlives its owner.
+fn spawn_parent_death_watchdog(mount_point: PathBuf) {
+    let original = unsafe { libc::getppid() };
+    thread::spawn(move || {
+        watch_parent(
+            original,
+            || unsafe { libc::getppid() },
+            || teardown(&mount_point),
+            PARENT_WATCH_INTERVAL,
+        );
+    });
+}
+
+/// Best-effort force-unmount, then exit. Exiting closes our `/dev/macfuse` fd,
+/// which the kernel treats as the unmount signal; the explicit unmount first
+/// covers the case where the kernel would otherwise leave a dead mount behind.
+fn teardown(mount_point: &Path) -> ! {
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        if let Ok(path) = CString::new(mount_point.as_os_str().as_bytes()) {
+            unsafe { libc::unmount(path.as_ptr(), libc::MNT_FORCE) };
+        }
+    }
+    let _ = mount_point;
+    std::process::exit(0);
 }
 
 fn mount_point_from_args() -> io::Result<PathBuf> {
@@ -1161,5 +1224,70 @@ fn errno(code: u32) -> c_int {
         30 => libc::EROFS,
         38 | 78 => libc::ENOSYS,
         _ => libc::EIO,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+
+    #[test]
+    fn orphaned_only_when_parent_pid_changes() {
+        assert!(!orphaned(2078, 2078));
+        assert!(orphaned(2078, 1)); // reparented to launchd/init
+        assert!(orphaned(2078, 4242)); // reparented to a subreaper
+    }
+
+    #[test]
+    fn watch_parent_fires_once_the_owner_is_gone() {
+        // Owner shows as pid 2078 for two polls, then the kernel reparents us to 1.
+        let polls = Cell::new(0);
+        let fired = Cell::new(false);
+
+        watch_parent(
+            2078,
+            || {
+                let n = polls.get();
+                polls.set(n + 1);
+                if n < 2 { 2078 } else { 1 }
+            },
+            || fired.set(true),
+            Duration::ZERO,
+        );
+
+        assert!(fired.get(), "teardown must run after the owner dies");
+        assert_eq!(
+            polls.get(),
+            3,
+            "two matching polls, then the reparented one"
+        );
+    }
+
+    #[test]
+    fn watch_parent_does_not_fire_while_owner_lives() {
+        // If the owner never changes, the loop keeps polling and never tears down.
+        let polls = Cell::new(0);
+        let fired = Cell::new(false);
+
+        watch_parent(
+            2078,
+            || {
+                polls.set(polls.get() + 1);
+                if polls.get() >= 5 {
+                    return 1; // end the test by simulating death on the 5th poll
+                }
+                2078
+            },
+            || fired.set(true),
+            Duration::ZERO,
+        );
+
+        assert!(fired.get());
+        assert_eq!(
+            polls.get(),
+            5,
+            "stayed alive across the first four matching polls"
+        );
     }
 }
