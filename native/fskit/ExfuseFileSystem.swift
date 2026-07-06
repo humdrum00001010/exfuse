@@ -17,6 +17,7 @@ final class ExfuseFileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations {
         replyHandler: @escaping (FSProbeResult?, (any Error)?) -> Void
     ) {
         log.debug("probeResource")
+        configureWire(from: resource)
         let volumeID = FSContainerIdentifier(uuid: Bundle.main.exfuseVolumeUUID)
         replyHandler(FSProbeResult.usable(name: "exfuse", containerID: volumeID), nil)
     }
@@ -27,8 +28,24 @@ final class ExfuseFileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations {
         replyHandler: @escaping (FSVolume?, (any Error)?) -> Void
     ) {
         log.debug("loadResource")
+        configureWire(from: resource)
         containerStatus = .ready
         replyHandler(ExfuseVolume(), nil)
+    }
+
+    // The default mount resource is `exfuse://127.0.0.1:<port>` — the wire
+    // listener address travels in the URL. Block-device mounts keep the
+    // Info.plist port.
+    private func configureWire(from resource: FSResource) {
+        guard
+            let urlResource = resource as? FSGenericURLResource,
+            let port = urlResource.url.port,
+            port > 0, port <= 65_535
+        else {
+            return
+        }
+
+        ExfuseWireClient.shared.configure(port: UInt16(port))
     }
 
     func unloadResource(

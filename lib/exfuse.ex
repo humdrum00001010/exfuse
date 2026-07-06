@@ -23,13 +23,8 @@ defmodule Exfuse do
   def mount(mount_point, fs_mod, fs_state, opts \\ []) do
     backend = Keyword.get(opts, :backend, backend())
 
-    case prepare_backend(mount_point, backend, opts) do
-      {:ok, backend_opts} ->
-        start_mount(mount_point, fs_mod, fs_state, backend, opts, backend_opts)
-
-      {:error, reason} ->
-        {:error, reason}
-    end
+    {:ok, backend_opts} = prepare_backend(mount_point, backend, opts)
+    start_mount(mount_point, fs_mod, fs_state, backend, opts, backend_opts)
   end
 
   defp start_mount(mount_point, fs_mod, fs_state, backend, opts, backend_opts) do
@@ -61,13 +56,19 @@ defmodule Exfuse do
 
   defp prepare_backend(_mount_point, :fuse, _opts), do: {:ok, []}
 
+  # The default FSKit resource is a generic URL (`exfuse://127.0.0.1:<port>`)
+  # pointing at the wire listener: it carries the backend port, needs no stub
+  # disk image, and classifies the mount as URL-backed rather than local
+  # block storage (local volumes are assumed cache-coherent by the kernel).
+  # Pass `:resource` explicitly to mount from a block device instead.
   defp prepare_backend(_mount_point, :fskit, opts) do
     cond do
       resource = Keyword.get(opts, :resource) ->
         {:ok, fskit_resource: %{device: resource, image: nil, owned: false}}
 
       true ->
-        create_fskit_resource()
+        port = Keyword.get(opts, :wire_port, 35_368)
+        {:ok, fskit_resource: %{device: "exfuse://127.0.0.1:#{port}", image: nil, owned: false}}
     end
   end
 
@@ -180,24 +181,6 @@ defmodule Exfuse do
     case System.cmd("kill", ["-0", pid], stderr_to_stdout: true) do
       {_, 0} -> System.cmd("kill", ["-9", pid], stderr_to_stdout: true)
       _ -> :ok
-    end
-  end
-
-  defp create_fskit_resource do
-    image = Path.join(System.tmp_dir!(), "exfuse-#{System.unique_integer([:positive])}.dmg")
-
-    with {_, 0} <- System.cmd("mkfile", ["-n", "1m", image], stderr_to_stdout: true),
-         {device, 0} <-
-           System.cmd(
-             "hdiutil",
-             ["attach", "-imagekey", "diskimage-class=CRawDiskImage", "-nomount", image],
-             stderr_to_stdout: true
-           ) do
-      {:ok, fskit_resource: %{device: String.trim(device), image: image, owned: true}}
-    else
-      {out, status} ->
-        _ = File.rm(image)
-        {:error, {:fskit_resource_failed, status, String.trim(out)}}
     end
   end
 
