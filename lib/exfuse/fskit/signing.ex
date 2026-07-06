@@ -1,10 +1,13 @@
 defmodule Exfuse.FSKit.Signing do
   @moduledoc false
 
+  # Apple Development outranks Developer ID: the FSKit appex must be signed by
+  # a certificate its embedded (development) provisioning profile authorizes,
+  # and team provisioning profiles only list development certificates.
   @preferred_identity_prefixes [
-    "Developer ID Application:",
     "Apple Development:",
-    "Mac Developer:"
+    "Mac Developer:",
+    "Developer ID Application:"
   ]
 
   def resolve_identity(explicit_identity, opts \\ []) do
@@ -57,8 +60,8 @@ defmodule Exfuse.FSKit.Signing do
   end
 
   def preferred_identity(identities) do
-    Enum.find(identities, fn identity ->
-      Enum.any?(@preferred_identity_prefixes, &String.starts_with?(identity, &1))
+    Enum.find_value(@preferred_identity_prefixes, fn prefix ->
+      Enum.find(identities, &String.starts_with?(&1, prefix))
     end)
   end
 

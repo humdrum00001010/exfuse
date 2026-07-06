@@ -2,14 +2,20 @@ import FSKit
 import Foundation
 
 final class ExfuseItem: FSItem {
-    let path: String
-    let name: FSFileName
-    let attributes: FSItem.Attributes
+    var path: String
+    var name: FSFileName
+    var attributes: FSItem.Attributes
+
+    // Assigned once at first sight and kept for the item's lifetime, even
+    // across renames: FSKit correlates FSItem instances with kernel state, so
+    // an item's identifier must never change while the kernel still holds it.
+    let id: FSItem.Identifier
 
     init(path: String, name: FSFileName, attributes: FSItem.Attributes) {
         self.path = path
         self.name = name
         self.attributes = attributes
+        self.id = attributes.fileID
         super.init()
     }
 

@@ -251,6 +251,10 @@ defmodule Exfuse.Server do
       handle_fusereq(state, event, @request_getattr, fn
         {mode, type, size} when is_integer(mode) and is_integer(type) and is_integer(size) ->
           <<mode::size(32), type::size(32), size::size(32)>>
+
+        {mode, type, size, mtime}
+        when is_integer(mode) and is_integer(type) and is_integer(size) and is_integer(mtime) ->
+          <<mode::size(32), type::size(32), size::size(32), mtime::size(64)>>
       end)
 
     {:noreply, new_state}

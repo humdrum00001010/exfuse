@@ -133,6 +133,14 @@ defmodule Exfuse.FsDslTest do
       assert {:ok, [answer: 42]} = DefaultInitFs.exfuse_init("/mnt", answer: 42)
     end
 
+    test "attr helpers carry an optional mtime as a 4-tuple" do
+      import Exfuse.Fs.Dsl
+
+      assert file(size: 6) == {0o0644, 2, 6}
+      assert file(size: 6, mtime: 1_700_000_123) == {0o0644, 2, 6, 1_700_000_123}
+      assert dir(mtime: 42) == {0o0755, 1, 0, 42}
+    end
+
     test "matches root routes" do
       state = state()
       assert_ok(SampleFs, :readdir, "/", state, ["docx", "latest"], state)

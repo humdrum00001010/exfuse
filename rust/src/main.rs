@@ -448,6 +448,10 @@ unsafe extern "C" fn fuse_getattr(path: *const c_char, stat: *mut libc::stat) ->
                 (*stat).st_uid = libc::getuid();
                 (*stat).st_gid = libc::getgid();
                 (*stat).st_blocks = (attr.size + 511) / 512;
+                if let Some(mtime) = attr.mtime {
+                    (*stat).st_mtime = mtime;
+                    (*stat).st_ctime = mtime;
+                }
             }
             0
         }
@@ -863,6 +867,7 @@ struct Attr {
     mode: libc::mode_t,
     nlink: libc::nlink_t,
     size: libc::off_t,
+    mtime: Option<i64>,
 }
 
 struct RequestContext {
@@ -929,7 +934,7 @@ impl Port {
         let response = self.request(Message::Getattr, path.as_bytes())?;
         let data = response.ok()?;
 
-        if data.len() != 12 {
+        if data.len() != 12 && data.len() != 20 {
             return Err(libc::EIO);
         }
 
@@ -938,10 +943,21 @@ impl Port {
         let kind_mode = kind.fuse_mode();
         let size = read_u32(&data[8..12]) as libc::off_t;
 
+        // Extended attr form: a trailing u64 mtime lets content-projection
+        // filesystems signal content changes for kernel cache revalidation.
+        let mtime = if data.len() == 20 {
+            let mut raw = [0u8; 8];
+            raw.copy_from_slice(&data[12..20]);
+            Some(i64::from_be_bytes(raw))
+        } else {
+            None
+        };
+
         Ok(Attr {
             mode: kind_mode | ((mode & 0o7777) as libc::mode_t),
             nlink: if matches!(kind, NodeKind::Dir) { 2 } else { 1 },
             size,
+            mtime,
         })
     }
 

@@ -393,11 +393,17 @@ defmodule Exfuse.Fs.Dsl do
 
   defp dispatch_name(op), do: :"__exfuse_#{op}__"
 
+  # `mtime:` is optional; when given, the reply becomes a 4-tuple and travels
+  # as the extended 20-byte wire attr. Content-projection filesystems use it
+  # to signal content changes so kernels that cache data (FSKit) revalidate.
   defp attr(type, opts) do
     mode = Keyword.get(opts, :mode, default_mode(type))
     size = Keyword.get(opts, :size, attr_size(type, opts))
 
-    {mode, attr_type(type), size}
+    case Keyword.get(opts, :mtime) do
+      nil -> {mode, attr_type(type), size}
+      mtime when is_integer(mtime) -> {mode, attr_type(type), size, mtime}
+    end
   end
 
   defp attr_size(:symlink, opts) do
@@ -421,7 +427,10 @@ defmodule Exfuse.Fs.Dsl do
     mode = Map.get(attrs, :mode, default_mode(type))
     size = Map.get(attrs, :size, 0)
 
-    {mode, attr_type(type), size}
+    case Map.get(attrs, :mtime) do
+      nil -> {mode, attr_type(type), size}
+      mtime -> {mode, attr_type(type), size, mtime}
+    end
   end
 
   defp normalize_attr({mode, type, size}) when is_atom(type) do
@@ -429,6 +438,12 @@ defmodule Exfuse.Fs.Dsl do
   end
 
   defp normalize_attr({mode, type, size}), do: {mode, type, size}
+
+  defp normalize_attr({mode, type, size, mtime}) when is_atom(type) do
+    {mode, attr_type(type), size, mtime}
+  end
+
+  defp normalize_attr({mode, type, size, mtime}), do: {mode, type, size, mtime}
 
   defp attr_type(:dir), do: @attr_dir
   defp attr_type(:file), do: @attr_file

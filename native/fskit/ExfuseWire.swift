@@ -33,6 +33,10 @@ struct ExfuseAttr {
     let mode: UInt32
     let kind: ExfuseNodeKind
     let size: UInt64
+
+    // Optional extended form: a backend-supplied mtime that changes when the
+    // (projected) content changes, so the kernel revalidates cached data.
+    let mtime: UInt64?
 }
 
 final class ExfuseWireClient {
@@ -52,19 +56,20 @@ final class ExfuseWireClient {
 
     func getattr(_ path: String) throws -> ExfuseAttr {
         let response = try request(.getattr, payload: Data(path.utf8))
-        guard response.count == 12 else {
+        guard response.count == 12 || response.count == 20 else {
             throw posixError(EIO)
         }
 
         let mode = response.readUInt32(at: 0)
         let kindValue = response.readUInt32(at: 4)
         let size = UInt64(response.readUInt32(at: 8))
+        let mtime = response.count == 20 ? response.readUInt64(at: 12) : nil
 
         guard let kind = ExfuseNodeKind(rawValue: kindValue) else {
             throw posixError(EIO)
         }
 
-        return ExfuseAttr(mode: mode, kind: kind, size: size)
+        return ExfuseAttr(mode: mode, kind: kind, size: size, mtime: mtime)
     }
 
     func readdir(_ path: String) throws -> [String] {

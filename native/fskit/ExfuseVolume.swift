@@ -8,6 +8,20 @@ final class ExfuseVolume: FSVolume {
     private let client = ExfuseWireClient.shared
     private let root = ExfuseItem.root()
 
+    // Item timestamps must be STABLE across getattr calls: a fresh
+    // currentTimespec() per call makes the kernel's rename/lookup
+    // revalidation spin forever (attributes never settle) and the rename
+    // fails without ever reaching the backend.
+    private let mountEpoch = timespec(tv_sec: time(nil), tv_nsec: 0)
+
+    // FSKit correlates volume state by FSItem object identity, so every
+    // lookup of the same path must return the SAME instance. Returning a
+    // fresh FSItem per lookup breaks rename-over-existing (ENOENT before
+    // renameItem is ever called) because fskitd cannot match the destination
+    // item it already holds.
+    private var itemsByPath: [String: ExfuseItem] = [:]
+    private let itemsLock = NSLock()
+
     init() {
         super.init(
             volumeID: FSVolume.Identifier(uuid: Bundle.main.exfuseVolumeUUID),
@@ -128,6 +142,14 @@ extension ExfuseVolume: FSVolume.Operations {
 
     func reclaimItem(_ item: FSItem) async throws {
         log.debug("reclaimItem")
+
+        if let item = item as? ExfuseItem {
+            itemsLock.lock()
+            if itemsByPath[item.path] === item {
+                itemsByPath.removeValue(forKey: item.path)
+            }
+            itemsLock.unlock()
+        }
     }
 
     func readSymbolicLink(_ item: FSItem) async throws -> FSFileName {
@@ -194,6 +216,12 @@ extension ExfuseVolume: FSVolume.Operations {
         } else {
             try client.unlink(item.path)
         }
+
+        itemsLock.lock()
+        if itemsByPath[item.path] === item {
+            itemsByPath.removeValue(forKey: item.path)
+        }
+        itemsLock.unlock()
     }
 
     func renameItem(
@@ -214,6 +242,19 @@ extension ExfuseVolume: FSVolume.Operations {
         let source = try childPath(directory: sourceDirectory, name: sourceName)
         let destination = try childPath(directory: destinationDirectory, name: destinationName)
         try client.rename(from: source, to: destination)
+
+        itemsLock.lock()
+        itemsByPath.removeValue(forKey: source)
+        itemsByPath.removeValue(forKey: destination)
+
+        if let item = item as? ExfuseItem {
+            item.path = destination
+            item.name = fileName(for: destination)
+            itemsByPath[destination] = item
+        }
+
+        itemsLock.unlock()
+
         return fileName(for: destination)
     }
 
@@ -258,11 +299,25 @@ extension ExfuseVolume: FSVolume.Operations {
 
     private func item(for path: String) throws -> ExfuseItem {
         let normalized = normalizePath(path)
-        return ExfuseItem(
+        let attrs = try attributes(for: normalized)
+
+        itemsLock.lock()
+        defer { itemsLock.unlock() }
+
+        if let existing = itemsByPath[normalized] {
+            attrs.fileID = existing.id
+            existing.attributes = attrs
+            return existing
+        }
+
+        let item = ExfuseItem(
             path: normalized,
             name: fileName(for: normalized),
-            attributes: try attributes(for: normalized)
+            attributes: attrs
         )
+
+        itemsByPath[normalized] = item
+        return item
     }
 
     private func attributes(for path: String) throws -> FSItem.Attributes {
@@ -277,10 +332,13 @@ extension ExfuseVolume: FSVolume.Operations {
         attrs.allocSize = attr.size
         attrs.fileID = itemID(for: path)
         attrs.parentID = parentID(for: path)
-        attrs.modifyTime = currentTimespec()
-        attrs.changeTime = attrs.modifyTime
-        attrs.accessTime = attrs.modifyTime
-        attrs.birthTime = attrs.modifyTime
+        // Backend mtime (when supplied) tracks content changes; otherwise the
+        // stable mount epoch keeps kernel revalidation from spinning.
+        let stamp = attr.mtime.map { timespec(tv_sec: time_t($0), tv_nsec: 0) } ?? mountEpoch
+        attrs.modifyTime = stamp
+        attrs.changeTime = stamp
+        attrs.accessTime = stamp
+        attrs.birthTime = mountEpoch
         return attrs
     }
 

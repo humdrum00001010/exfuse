@@ -30,6 +30,15 @@ defmodule Exfuse.FSKit.SigningTest do
     assert Signing.preferred_identity(["Local Test Cert"]) == nil
   end
 
+  test "prefers Apple Development over Developer ID regardless of keychain order" do
+    identities = [
+      "Developer ID Application: Example Corp (TEAMID)",
+      "Apple Development: Ada Lovelace (TEAMID)"
+    ]
+
+    assert Signing.preferred_identity(identities) == "Apple Development: Ada Lovelace (TEAMID)"
+  end
+
   test "allow_adhoc uses ad-hoc identity when none is configured" do
     previous = System.get_env("EXFUSE_CODESIGN_IDENTITY")
     System.delete_env("EXFUSE_CODESIGN_IDENTITY")

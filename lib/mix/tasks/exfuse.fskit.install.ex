@@ -106,7 +106,22 @@ defmodule Mix.Tasks.Exfuse.Fskit.Install do
       :ok
     else
       do_verify_extension_signature!(source_extension)
+      verify_extension_profile!(source_extension)
     end
+  end
+
+  defp verify_extension_profile!(source_extension) do
+    profile = Path.join(source_extension, "Contents/embedded.provisionprofile")
+
+    unless File.exists?(profile) do
+      Mix.raise("""
+      FSKit extension has no embedded.provisionprofile; AMFI will kill it at launch
+      because the FSKit entitlement is restricted. Rebuild with --build (the bundle
+      task embeds a matching profile) after minting one with mix exfuse.fskit.provision.
+      """)
+    end
+
+    :ok
   end
 
   defp do_verify_extension_signature!(source_extension) do
