@@ -7,11 +7,13 @@ and copies it to `priv/exfuse_port`. It is not a NIF.
 
 Set `EXFUSE_PORT=/path/to/exfuse_port` to override the port executable.
 
-## macOS backend migration
+## Backends
 
-The original macOS backend uses macFUSE through the Rust port. Newer macOS
-releases provide FSKit, which avoids the reduced-security boot-mode setup that
-macFUSE requires. The FSKit migration lives under `native/fskit`:
+Backend selection is by OS: macOS mounts through the FSKit extension, and
+every other Unix mounts through the FUSE/libfuse Rust port. There is no
+macFUSE backend — on macOS the port binary is not even built, so neither
+cargo nor macFUSE is needed there. The FSKit implementation lives under
+`native/fskit`:
 
 - `ExfuseFSKitExtension.swift` is the FSKit `UnaryFileSystemExtension`
   entrypoint.
@@ -72,17 +74,7 @@ System Settings > General > Login Items & Extensions > File System Extensions
 Enable `exfuse` there. If that toggle is still off, FSKit rejects the mount with
 `Module org.exfuse.fskit.extension is disabled!`.
 
-After approval, choose the FSKit backend explicitly:
-
-```elixir
-Exfuse.mount("/Volumes/DocsFs", DocsFs, state, backend: :fskit)
-```
-
-or make FSKit the process default:
-
-```sh
-EXFUSE_BACKEND=fskit mix run
-```
+After approval, `Exfuse.mount/4` on macOS uses FSKit automatically.
 
 ## Build
 

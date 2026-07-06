@@ -23,8 +23,13 @@ defmodule Exfuse do
   def mount(mount_point, fs_mod, fs_state, opts \\ []) do
     backend = Keyword.get(opts, :backend, backend())
 
-    {:ok, backend_opts} = prepare_backend(mount_point, backend, opts)
-    start_mount(mount_point, fs_mod, fs_state, backend, opts, backend_opts)
+    case prepare_backend(mount_point, backend, opts) do
+      {:ok, backend_opts} ->
+        start_mount(mount_point, fs_mod, fs_state, backend, opts, backend_opts)
+
+      {:error, reason} ->
+        {:error, reason}
+    end
   end
 
   defp start_mount(mount_point, fs_mod, fs_state, backend, opts, backend_opts) do
@@ -54,7 +59,14 @@ defmodule Exfuse do
     end
   end
 
-  defp prepare_backend(_mount_point, :fuse, _opts), do: {:ok, []}
+  # The FUSE/libfuse backend serves non-mac systems only; macOS mounts through
+  # FSKit and the port binary is not even built there.
+  defp prepare_backend(_mount_point, :fuse, _opts) do
+    case :os.type() do
+      {:unix, :darwin} -> {:error, :fuse_backend_unsupported_on_macos}
+      _ -> {:ok, []}
+    end
+  end
 
   # The default FSKit resource is a generic URL (`exfuse://127.0.0.1:<port>`)
   # pointing at the wire listener: it carries the backend port, needs no stub
@@ -185,8 +197,8 @@ defmodule Exfuse do
   end
 
   defp backend do
-    case System.get_env("EXFUSE_BACKEND") do
-      "fskit" -> :fskit
+    case :os.type() do
+      {:unix, :darwin} -> :fskit
       _ -> :fuse
     end
   end

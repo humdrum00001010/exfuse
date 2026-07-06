@@ -92,6 +92,18 @@ defmodule Mix.Tasks.Compile.ExfuseRust do
 
   @impl true
   def run(_args) do
+    if :os.type() == {:unix, :darwin} do
+      # The Rust port is the FUSE/libfuse bridge for non-mac systems only;
+      # macOS mounts through the FSKit extension and must not require cargo
+      # or macFUSE (pkg-config libfuse) to build.
+      Mix.shell().info("Skipping exfuse_port build on macOS (FSKit backend needs no port)")
+      {:noop, []}
+    else
+      build_port()
+    end
+  end
+
+  defp build_port do
     cargo = System.find_executable("cargo") || Mix.raise("cargo not found")
     root = File.cwd!()
     manifest = Path.join(root, "rust/Cargo.toml")
