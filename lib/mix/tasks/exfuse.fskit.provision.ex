@@ -69,22 +69,12 @@ defmodule Mix.Tasks.Exfuse.Fskit.Provision do
     end
   end
 
-  # The team id is the OU of the signing certificate, NOT the parenthesized id
-  # in an "Apple Development: Name (XXXXXXXXXX)" identity (that one is personal).
   defp team_from_identity!(identity) do
-    with {pem, 0} <-
-           System.cmd("security", ["find-certificate", "-c", identity, "-p"],
-             stderr_to_stdout: true
-           ),
-         {subject, 0} <-
-           System.cmd("openssl", ["x509", "-noout", "-subject"],
-             input: pem,
-             stderr_to_stdout: true
-           ),
-         [_, team] <- Regex.run(~r/OU\s*=\s*([A-Z0-9]+)/, subject) do
-      team
-    else
-      _ ->
+    case Provisioning.team_identifier(identity) do
+      {:ok, team} ->
+        team
+
+      {:error, _reason} ->
         Mix.raise(
           "could not derive the team id from #{inspect(identity)}; pass it with --team TEAMID"
         )

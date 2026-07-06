@@ -85,6 +85,36 @@ defmodule Exfuse.FSKit.Provisioning do
       not expired?(profile, now)
   end
 
+  @doc """
+  The team id of a signing identity — the OU of its certificate, NOT the
+  parenthesized id in an "Apple Development: Name (XXXXXXXXXX)" identity
+  (that one is personal).
+  """
+  def team_identifier(identity) do
+    pem_path = Path.join(System.tmp_dir!(), "exfuse-cert-#{:erlang.phash2(identity)}.pem")
+
+    try do
+      with {pem, 0} <-
+             System.cmd("security", ["find-certificate", "-c", identity, "-p"],
+               stderr_to_stdout: true
+             ),
+           :ok <- File.write(pem_path, pem),
+           {subject, 0} <-
+             System.cmd("openssl", ["x509", "-in", pem_path, "-noout", "-subject"],
+               stderr_to_stdout: true
+             ),
+           [_, team] <- Regex.run(~r/OU\s*=\s*([A-Z0-9]+)/, subject) do
+        {:ok, team}
+      else
+        _ -> {:error, :team_not_derivable}
+      end
+    after
+      File.rm(pem_path)
+    end
+  rescue
+    error -> {:error, Exception.message(error)}
+  end
+
   @doc "Copy the profile to `Contents/embedded.provisionprofile` inside the appex."
   def embed(profile, appex_path) do
     destination = Path.join(appex_path, "Contents/embedded.provisionprofile")

@@ -49,39 +49,56 @@ defmodule Mix.Tasks.Exfuse.Fskit.Bundle do
       output = Path.expand(Keyword.get(opts, :output, "_build/fskit/ExfuseFSKit.app"), root)
       sign? = not Keyword.get(opts, :no_sign, false)
       identity = if sign?, do: identity!(opts), else: nil
-      profile = if sign? and identity != "-", do: profile!(opts), else: nil
+      method = extension_build_method(identity)
+      profile = if sign? and identity != "-" and method == :swiftc, do: profile!(opts), else: nil
 
-      build_bundle(root, output)
+      build_bundle(root, output, identity, method)
 
       if sign? do
-        sign_bundle(root, output, identity, profile)
+        sign_bundle(root, output, identity, profile, method)
       end
 
-      Mix.shell().info("Built #{output}")
+      Mix.shell().info("Built #{output} (extension via #{method})")
     else
       Mix.raise("FSKit bundles can only be built on macOS")
     end
   end
 
-  defp build_bundle(root, output) do
+  # An appex built by bare swiftc launches, runs its @main, and then exits
+  # instead of staying resident to serve the extension; the
+  # extensionkit-extension product type carries link/packaging behavior only
+  # Xcode reproduces. Prefer xcodebuild whenever full Xcode and a real signing
+  # identity are available; the swiftc path remains for compile checks and
+  # ad-hoc bundles.
+  defp extension_build_method(identity) do
+    if is_binary(identity) and identity != "-" and xcode_available?() do
+      :xcode
+    else
+      :swiftc
+    end
+  end
+
+  defp xcode_available? do
+    case System.cmd("xcode-select", ["-p"], stderr_to_stdout: true) do
+      {out, 0} -> String.contains?(out, ".app")
+      _ -> false
+    end
+  rescue
+    _ -> false
+  end
+
+  defp build_bundle(root, output, identity, method) do
     swiftc = swiftc!()
     sdk = sdk!()
     app_macos = Path.join(output, "Contents/MacOS")
     extension_root = Path.join(output, "Contents/Extensions/ExfuseFSKitExtension.appex")
-    extension_macos = Path.join(extension_root, "Contents/MacOS")
 
     File.rm_rf!(output)
     File.mkdir_p!(app_macos)
-    File.mkdir_p!(extension_macos)
 
     File.cp!(
       Path.join(root, "native/fskit/host/Info.plist"),
       Path.join(output, "Contents/Info.plist")
-    )
-
-    File.cp!(
-      Path.join(root, "native/fskit/Info.plist"),
-      Path.join(extension_root, "Contents/Info.plist")
     )
 
     compile!(
@@ -92,6 +109,21 @@ defmodule Mix.Tasks.Exfuse.Fskit.Bundle do
       ["Foundation"]
     )
 
+    case method do
+      :xcode -> build_extension_xcode!(root, extension_root, identity)
+      :swiftc -> build_extension_swiftc!(root, extension_root, swiftc, sdk)
+    end
+  end
+
+  defp build_extension_swiftc!(root, extension_root, swiftc, sdk) do
+    extension_macos = Path.join(extension_root, "Contents/MacOS")
+    File.mkdir_p!(extension_macos)
+
+    File.cp!(
+      Path.join(root, "native/fskit/Info.plist"),
+      Path.join(extension_root, "Contents/Info.plist")
+    )
+
     compile!(
       swiftc,
       sdk,
@@ -99,6 +131,65 @@ defmodule Mix.Tasks.Exfuse.Fskit.Bundle do
       Path.join(extension_macos, "ExfuseFSKitExtension"),
       ["FSKit", "ExtensionFoundation", "Foundation", "OSLog"]
     )
+  end
+
+  defp build_extension_xcode!(root, extension_root, identity) do
+    team = team!(identity)
+    symroot = Path.join(root, "_build/fskit/xcode")
+
+    args = [
+      "-project",
+      Path.join(root, "native/fskit/xcode/ExfuseFSKitExtension.xcodeproj"),
+      "-target",
+      "ExfuseFSKitExtension",
+      "-configuration",
+      "Release",
+      "build",
+      "-allowProvisioningUpdates",
+      "DEVELOPMENT_TEAM=#{team}",
+      "SYMROOT=#{symroot}"
+    ]
+
+    case System.cmd("xcodebuild", args, stderr_to_stdout: true) do
+      {_out, 0} ->
+        built = Path.join(symroot, "Release/ExfuseFSKitExtension.appex")
+
+        unless File.dir?(built) do
+          Mix.raise("xcodebuild succeeded but no appex at #{built}")
+        end
+
+        File.rm_rf!(extension_root)
+        run_cmd!("ditto", [built, extension_root])
+
+      {out, status} ->
+        errors =
+          out
+          |> String.split("\n")
+          |> Enum.filter(&String.contains?(&1, "error"))
+          |> Enum.join("\n")
+
+        Mix.raise("""
+        xcodebuild failed with status #{status}:
+        #{if errors == "", do: String.slice(out, max(byte_size(out) - 2000, 0), 2000), else: errors}
+        """)
+    end
+  end
+
+  defp team!(identity) do
+    case Provisioning.team_identifier(identity) do
+      {:ok, team} ->
+        team
+
+      {:error, reason} ->
+        Mix.raise("could not derive the team id from #{inspect(identity)}: #{inspect(reason)}")
+    end
+  end
+
+  defp run_cmd!(command, args) do
+    case System.cmd(command, args, stderr_to_stdout: true) do
+      {_out, 0} -> :ok
+      {out, status} -> Mix.raise("#{command} failed with status #{status}\n#{out}")
+    end
   end
 
   defp compile!(swiftc, sdk, sources, output, frameworks) do
@@ -117,7 +208,17 @@ defmodule Mix.Tasks.Exfuse.Fskit.Bundle do
     end
   end
 
-  defp sign_bundle(root, output, identity, profile) do
+  # The Xcode-built appex arrives signed with its provisioning profile
+  # embedded; only the host app needs our signature then.
+  defp sign_bundle(root, output, identity, _profile, :xcode) do
+    codesign!(
+      output,
+      identity,
+      Path.join(root, "native/fskit/host/Entitlements.plist")
+    )
+  end
+
+  defp sign_bundle(root, output, identity, profile, :swiftc) do
     extension = Path.join(output, "Contents/Extensions/ExfuseFSKitExtension.appex")
     base_entitlements = Path.join(root, "native/fskit/Entitlements.plist")
 
