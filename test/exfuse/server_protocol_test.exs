@@ -26,6 +26,44 @@ defmodule Exfuse.ServerProtocolTest do
     def exfuse_init(_mount_point, state), do: {:ok, state}
   end
 
+  test "server default backend is FSKit on macOS" do
+    if :os.type() == {:unix, :darwin} do
+      mount_point =
+        Path.join(System.tmp_dir!(), "exfuse-fskit-default-#{System.unique_integer([:positive])}")
+
+      File.mkdir_p!(mount_point)
+      on_exit(fn -> File.rm_rf(mount_point) end)
+
+      pid =
+        start_supervised!(%{
+          id: {Exfuse.Server, mount_point},
+          start:
+            {Exfuse.Server, :start_link,
+             [
+               mount_point,
+               InitFs,
+               :state,
+               [wire_port: free_port(), fskit_resource: %{owned: false}]
+             ]}
+        })
+
+      assert {^mount_point, InitFs, :state, nil} = Exfuse.Server.status(pid)
+    end
+  end
+
+  test "server rejects explicit FUSE backend on macOS" do
+    if :os.type() == {:unix, :darwin} do
+      mount_point =
+        Path.join(System.tmp_dir!(), "exfuse-fuse-rejected-#{System.unique_integer([:positive])}")
+
+      File.mkdir_p!(mount_point)
+      on_exit(fn -> File.rm_rf(mount_point) end)
+
+      assert {:error, :fuse_backend_unsupported_on_macos} =
+               Exfuse.MountSup.start_child(mount_point, InitFs, :state, backend: :fuse)
+    end
+  end
+
   defmodule FineGrainedFs do
     alias Exfuse.Socket
 

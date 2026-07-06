@@ -69,13 +69,27 @@ defmodule Exfuse.Server do
 
   @doc false
   def init([mount_point, fs_mod, fs_opts, opts]) do
-    case Keyword.get(opts, :backend, :fuse) do
+    case Keyword.get_lazy(opts, :backend, &default_backend/0) do
       :fskit -> init_fskit(mount_point, fs_mod, fs_opts, opts)
       :fuse -> init_fuse(mount_point, fs_mod, fs_opts)
     end
   end
 
+  defp default_backend do
+    case :os.type() do
+      {:unix, :darwin} -> :fskit
+      _ -> :fuse
+    end
+  end
+
   defp init_fuse(mount_point, fs_mod, fs_opts) do
+    case :os.type() do
+      {:unix, :darwin} -> {:stop, :fuse_backend_unsupported_on_macos}
+      _ -> init_fuse_port(mount_point, fs_mod, fs_opts)
+    end
+  end
+
+  defp init_fuse_port(mount_point, fs_mod, fs_opts) do
     with {:ok, fs_state} <- fs_mod.exfuse_init(mount_point, fs_opts),
          {:ok, port_path} <- Exfuse.App.find_port!() do
       port =
