@@ -40,18 +40,12 @@ struct ExfuseAttr {
 }
 
 final class ExfuseWireClient {
-    static let shared = ExfuseWireClient()
-
     private let lock = NSLock()
     private var fd: Int32 = -1
-    private var port: UInt16 = 35368
+    private let port: UInt16
 
-    func configure(port: UInt16) {
-        lock.lock()
-        defer { lock.unlock() }
-
+    init(port: UInt16) {
         self.port = port
-        closeLocked()
     }
 
     func getattr(_ path: String) throws -> ExfuseAttr {

@@ -9,7 +9,6 @@ final class ExfuseFileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations {
 
     private override init() {
         super.init()
-        ExfuseWireClient.shared.configure(port: Bundle.main.exfuseBackendPort)
     }
 
     func probeResource(
@@ -17,7 +16,6 @@ final class ExfuseFileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations {
         replyHandler: @escaping (FSProbeResult?, (any Error)?) -> Void
     ) {
         log.debug("probeResource")
-        configureWire(from: resource)
         let volumeID = FSContainerIdentifier(uuid: Bundle.main.exfuseVolumeUUID)
         replyHandler(FSProbeResult.usable(name: "exfuse", containerID: volumeID), nil)
     }
@@ -28,24 +26,23 @@ final class ExfuseFileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations {
         replyHandler: @escaping (FSVolume?, (any Error)?) -> Void
     ) {
         log.debug("loadResource")
-        configureWire(from: resource)
         containerStatus = .ready
-        replyHandler(ExfuseVolume(), nil)
+        replyHandler(ExfuseVolume(port: wirePort(from: resource)), nil)
     }
 
     // The default mount resource is `exfuse://127.0.0.1:<port>` — the wire
     // listener address travels in the URL. Block-device mounts keep the
     // Info.plist port.
-    private func configureWire(from resource: FSResource) {
+    private func wirePort(from resource: FSResource) -> UInt16 {
         guard
             let urlResource = resource as? FSGenericURLResource,
             let port = urlResource.url.port,
             port > 0, port <= 65_535
         else {
-            return
+            return Bundle.main.exfuseBackendPort
         }
 
-        ExfuseWireClient.shared.configure(port: UInt16(port))
+        return UInt16(port)
     }
 
     func unloadResource(
@@ -99,4 +96,3 @@ extension Bundle {
         return UUID(uuidString: "A9367419-7557-4CA7-B671-95B28F7DA15B")!
     }
 }
-

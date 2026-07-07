@@ -5,7 +5,7 @@ import os
 
 final class ExfuseVolume: FSVolume {
     private let log = Logger(subsystem: "ExfuseFSKit", category: "Volume")
-    private let client = ExfuseWireClient.shared
+    private let client: ExfuseWireClient
     private let root = ExfuseItem.root()
 
     // Item timestamps must be STABLE across getattr calls: a fresh
@@ -22,7 +22,9 @@ final class ExfuseVolume: FSVolume {
     private var itemsByPath: [String: ExfuseItem] = [:]
     private let itemsLock = NSLock()
 
-    init() {
+    init(port: UInt16) {
+        client = ExfuseWireClient(port: port)
+
         super.init(
             volumeID: FSVolume.Identifier(uuid: Bundle.main.exfuseVolumeUUID),
             volumeName: FSFileName(string: "exfuse")
