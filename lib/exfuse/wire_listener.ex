@@ -70,8 +70,12 @@ defmodule Exfuse.WireListener do
   defp serve(socket, server) do
     case :gen_tcp.recv(socket, 0) do
       {:ok, packet} ->
-        reply = Exfuse.Server.dispatch(server, packet)
-        :ok = :gen_tcp.send(socket, reply)
+        _ =
+          Task.start(fn ->
+            reply = Exfuse.Server.dispatch(server, packet, :infinity)
+            :ok = :gen_tcp.send(socket, reply)
+          end)
+
         serve(socket, server)
 
       {:error, _reason} ->

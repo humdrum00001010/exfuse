@@ -1,4 +1,5 @@
 use std::cmp::min;
+use std::collections::HashMap;
 use std::env;
 use std::ffi::{CStr, CString};
 use std::io::{self, Read, Write};
@@ -6,11 +7,13 @@ use std::mem;
 use std::os::raw::{c_char, c_int, c_uint, c_ulong, c_void};
 use std::path::{Path, PathBuf};
 use std::ptr;
-use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock, mpsc};
 use std::thread;
 use std::time::Duration;
 
 const MAGIC: u32 = 0xC021_55AC;
+const PROTOCOL_V2: u32 = 0x7632_0002;
 
 #[repr(u32)]
 #[derive(Clone, Copy)]
@@ -66,7 +69,7 @@ impl NodeKind {
     }
 }
 
-static PORT: OnceLock<Mutex<Port>> = OnceLock::new();
+static PORT: OnceLock<Port> = OnceLock::new();
 
 const SETATTR_MODE: i32 = 1 << 0;
 const SETATTR_UID: i32 = 1 << 1;
@@ -275,7 +278,8 @@ fn main() {
 
 fn run() -> io::Result<()> {
     let mount_point = mount_point_from_args()?;
-    let _ = PORT.set(Mutex::new(Port::new()));
+    let _ = PORT.set(Port::new());
+    PORT.get().expect("port initialized").start_reader();
 
     // `fuse_main_real` below blocks this thread in the libfuse session loop, which
     // only wakes for KERNEL filesystem ops — never for the BEAM's death. So a hard
@@ -427,7 +431,7 @@ impl WithCallbacks for FuseOperations {
 
 unsafe extern "C" fn fuse_init(_conn: *mut c_void) -> *mut c_void {
     if let Some(port) = PORT.get() {
-        let _ = port.lock().expect("port lock poisoned").send_status();
+        let _ = port.send_status();
     }
 
     ptr::null_mut()
@@ -828,10 +832,9 @@ fn setattr_path(path: *const c_char, attr: *mut SetattrX) -> c_int {
     }
 }
 
-fn with_port<T>(fun: impl FnOnce(&mut Port) -> Result<T, c_int>) -> Result<T, c_int> {
+fn with_port<T>(fun: impl FnOnce(&Port) -> Result<T, c_int>) -> Result<T, c_int> {
     let port = PORT.get().ok_or(libc::EIO)?;
-    let mut port = port.lock().map_err(|_| libc::EIO)?;
-    fun(&mut port)
+    fun(port)
 }
 
 fn path_to_str<'a>(path: *const c_char) -> Option<&'a str> {
@@ -909,19 +912,44 @@ impl RequestContext {
 }
 
 struct Port {
-    input: io::Stdin,
-    output: io::Stdout,
+    output: Mutex<io::Stdout>,
+    pending: Mutex<HashMap<u64, mpsc::Sender<Vec<u8>>>>,
+    next_request_id: AtomicU64,
 }
 
 impl Port {
     fn new() -> Self {
         Self {
-            input: io::stdin(),
-            output: io::stdout(),
+            output: Mutex::new(io::stdout()),
+            pending: Mutex::new(HashMap::new()),
+            next_request_id: AtomicU64::new(1),
         }
     }
 
-    fn send_status(&mut self) -> io::Result<()> {
+    fn start_reader(&'static self) {
+        thread::spawn(move || {
+            let mut input = io::stdin();
+            while let Ok(response) = read_packet(&mut input) {
+                if response.len() < 24
+                    || read_u32(&response[0..4]) != MAGIC
+                    || read_u32(&response[4..8]) != PROTOCOL_V2
+                {
+                    continue;
+                }
+                let request_id = read_u64(&response[12..20]);
+                if let Ok(mut pending) = self.pending.lock() {
+                    if let Some(sender) = pending.remove(&request_id) {
+                        let _ = sender.send(response);
+                    }
+                }
+            }
+            if let Ok(mut pending) = self.pending.lock() {
+                pending.clear();
+            }
+        });
+    }
+
+    fn send_status(&self) -> io::Result<()> {
         let mut payload = Vec::with_capacity(12);
         payload.extend_from_slice(&MAGIC.to_be_bytes());
         payload.extend_from_slice(&Message::Status.code().to_be_bytes());
@@ -930,7 +958,7 @@ impl Port {
         self.write_packet(&payload)
     }
 
-    fn getattr(&mut self, path: &str) -> Result<Attr, c_int> {
+    fn getattr(&self, path: &str) -> Result<Attr, c_int> {
         let response = self.request(Message::Getattr, path.as_bytes())?;
         let data = response.ok()?;
 
@@ -961,7 +989,7 @@ impl Port {
         })
     }
 
-    fn readdir(&mut self, path: &str) -> Result<Vec<String>, c_int> {
+    fn readdir(&self, path: &str) -> Result<Vec<String>, c_int> {
         let response = self.request(Message::Readdir, path.as_bytes())?;
         let data = response.ok()?;
 
@@ -972,7 +1000,7 @@ impl Port {
             .collect())
     }
 
-    fn readlink(&mut self, path: &str) -> Result<String, c_int> {
+    fn readlink(&self, path: &str) -> Result<String, c_int> {
         let response = self.request(Message::Readlink, path.as_bytes())?;
         let mut data = response.ok()?;
 
@@ -984,7 +1012,7 @@ impl Port {
     }
 
     fn read(
-        &mut self,
+        &self,
         path: &str,
         flags: u32,
         handle: u64,
@@ -1003,7 +1031,7 @@ impl Port {
         response.ok()
     }
 
-    fn write(&mut self, path: &str, handle: u64, offset: u64, data: &[u8]) -> Result<u32, c_int> {
+    fn write(&self, path: &str, handle: u64, offset: u64, data: &[u8]) -> Result<u32, c_int> {
         let mut payload = Vec::with_capacity(16 + 4 + path.len() + data.len());
         payload.extend_from_slice(&handle.to_be_bytes());
         payload.extend_from_slice(&offset.to_be_bytes());
@@ -1021,12 +1049,12 @@ impl Port {
         Ok(read_u32(&data[0..4]))
     }
 
-    fn open(&mut self, path: &str, flags: u32) -> Result<Option<u64>, c_int> {
+    fn open(&self, path: &str, flags: u32) -> Result<Option<u64>, c_int> {
         let response = self.request(Message::Open, &path_flags_payload(path, flags))?;
         open_handle(response)
     }
 
-    fn create(&mut self, path: &str, mode: libc::mode_t, flags: u32) -> Result<Option<u64>, c_int> {
+    fn create(&self, path: &str, mode: libc::mode_t, flags: u32) -> Result<Option<u64>, c_int> {
         let mut payload = Vec::with_capacity(12 + path.len());
         payload.extend_from_slice(&mode_bits(mode).to_be_bytes());
         payload.extend_from_slice(&flags.to_be_bytes());
@@ -1037,17 +1065,17 @@ impl Port {
         open_handle(response)
     }
 
-    fn truncate(&mut self, path: &str, size: u64) -> Result<(), c_int> {
+    fn truncate(&self, path: &str, size: u64) -> Result<(), c_int> {
         let response = self.request(Message::Truncate, &path_u64_payload(path, size))?;
         response.empty()
     }
 
-    fn unlink(&mut self, path: &str) -> Result<(), c_int> {
+    fn unlink(&self, path: &str) -> Result<(), c_int> {
         let response = self.request(Message::Unlink, path.as_bytes())?;
         response.empty()
     }
 
-    fn rename(&mut self, from: &str, to: &str, flags: c_uint) -> Result<(), c_int> {
+    fn rename(&self, from: &str, to: &str, flags: c_uint) -> Result<(), c_int> {
         let mut payload = Vec::with_capacity(12 + from.len() + to.len());
         payload.extend_from_slice(&flags.to_be_bytes());
         payload.extend_from_slice(&(from.len() as u32).to_be_bytes());
@@ -1059,22 +1087,22 @@ impl Port {
         response.empty()
     }
 
-    fn mkdir(&mut self, path: &str, mode: libc::mode_t) -> Result<(), c_int> {
+    fn mkdir(&self, path: &str, mode: libc::mode_t) -> Result<(), c_int> {
         let response = self.request(Message::Mkdir, &path_u32_payload(path, mode_bits(mode)))?;
         response.empty()
     }
 
-    fn rmdir(&mut self, path: &str) -> Result<(), c_int> {
+    fn rmdir(&self, path: &str) -> Result<(), c_int> {
         let response = self.request(Message::Rmdir, path.as_bytes())?;
         response.empty()
     }
 
-    fn chmod(&mut self, path: &str, mode: libc::mode_t) -> Result<(), c_int> {
+    fn chmod(&self, path: &str, mode: libc::mode_t) -> Result<(), c_int> {
         let response = self.request(Message::Chmod, &path_u32_payload(path, mode_bits(mode)))?;
         response.empty()
     }
 
-    fn chown(&mut self, path: &str, uid: libc::uid_t, gid: libc::gid_t) -> Result<(), c_int> {
+    fn chown(&self, path: &str, uid: libc::uid_t, gid: libc::gid_t) -> Result<(), c_int> {
         let mut payload = Vec::with_capacity(12 + path.len());
         payload.extend_from_slice(&uid.to_be_bytes());
         payload.extend_from_slice(&gid.to_be_bytes());
@@ -1085,17 +1113,17 @@ impl Port {
         response.empty()
     }
 
-    fn flush(&mut self, path: &str, flags: u32, handle: u64) -> Result<(), c_int> {
+    fn flush(&self, path: &str, flags: u32, handle: u64) -> Result<(), c_int> {
         let response = self.request(Message::Flush, &path_handle_payload(path, flags, handle))?;
         response.empty()
     }
 
-    fn release(&mut self, path: &str, flags: u32, handle: u64) -> Result<(), c_int> {
+    fn release(&self, path: &str, flags: u32, handle: u64) -> Result<(), c_int> {
         let response = self.request(Message::Release, &path_handle_payload(path, flags, handle))?;
         response.empty()
     }
 
-    fn fsync(&mut self, path: &str, datasync: bool, flags: u32, handle: u64) -> Result<(), c_int> {
+    fn fsync(&self, path: &str, datasync: bool, flags: u32, handle: u64) -> Result<(), c_int> {
         let mut payload = Vec::with_capacity(20 + path.len());
         payload.extend_from_slice(&(datasync as u32).to_be_bytes());
         payload.extend_from_slice(&flags.to_be_bytes());
@@ -1107,36 +1135,56 @@ impl Port {
         response.empty()
     }
 
-    fn request(&mut self, message: Message, payload: &[u8]) -> Result<PortResponse, c_int> {
+    fn request(&self, message: Message, payload: &[u8]) -> Result<PortResponse, c_int> {
         let code = message.code();
-        let mut packet = Vec::with_capacity(24 + payload.len());
+        let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
+        let mut packet = Vec::with_capacity(32 + payload.len());
         packet.extend_from_slice(&MAGIC.to_be_bytes());
+        packet.extend_from_slice(&PROTOCOL_V2.to_be_bytes());
         packet.extend_from_slice(&code.to_be_bytes());
+        packet.extend_from_slice(&request_id.to_be_bytes());
         RequestContext::current().write_to(&mut packet);
         packet.extend_from_slice(payload);
 
-        self.write_packet(&packet).map_err(|_| libc::EIO)?;
-        let response = read_packet(&mut self.input).map_err(|_| libc::EIO)?;
+        let (sender, receiver) = mpsc::channel();
+        self.pending
+            .lock()
+            .map_err(|_| libc::EIO)?
+            .insert(request_id, sender);
+        if self.write_packet(&packet).is_err() {
+            if let Ok(mut pending) = self.pending.lock() {
+                pending.remove(&request_id);
+            }
+            return Err(libc::EIO);
+        }
+        let response = receiver.recv().map_err(|_| libc::EIO)?;
 
-        if response.len() < 12 {
+        if response.len() < 24 {
             return Err(libc::EIO);
         }
 
-        if read_u32(&response[0..4]) != MAGIC || read_u32(&response[4..8]) != code {
+        if read_u32(&response[0..4]) != MAGIC
+            || read_u32(&response[4..8]) != PROTOCOL_V2
+            || read_u32(&response[8..12]) != code
+            || read_u64(&response[12..20]) != request_id
+        {
             return Err(libc::EIO);
         }
 
         Ok(PortResponse {
-            error: read_u32(&response[8..12]),
-            data: response[12..].to_vec(),
+            error: read_u32(&response[20..24]),
+            data: response[24..].to_vec(),
         })
     }
 
-    fn write_packet(&mut self, payload: &[u8]) -> io::Result<()> {
-        self.output
-            .write_all(&(payload.len() as u32).to_be_bytes())?;
-        self.output.write_all(payload)?;
-        self.output.flush()
+    fn write_packet(&self, payload: &[u8]) -> io::Result<()> {
+        let mut output = self
+            .output
+            .lock()
+            .map_err(|_| io::Error::other("output lock poisoned"))?;
+        output.write_all(&(payload.len() as u32).to_be_bytes())?;
+        output.write_all(payload)?;
+        output.flush()
     }
 }
 

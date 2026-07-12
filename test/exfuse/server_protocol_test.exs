@@ -26,6 +26,105 @@ defmodule Exfuse.ServerProtocolTest do
     def exfuse_init(_mount_point, state), do: {:ok, state}
   end
 
+  defmodule ConcurrentFs do
+    alias Exfuse.Socket
+
+    def exfuse_init(_mount_point, test_pid), do: {:ok, %{test_pid: test_pid, writes: []}}
+
+    def handle_event(:read, %{path: path}, %Socket{state: %{test_pid: test_pid}} = socket) do
+      send(test_pid, {:read_started, path, self()})
+
+      receive do
+        :continue -> {:reply, path, socket}
+        :crash -> exit(:read_callback_crashed)
+      end
+    end
+
+    def handle_event(:write, %{path: path, data: data}, %Socket{state: state} = socket) do
+      send(state.test_pid, {:write_started, path, self()})
+      receive do: (:continue -> :ok)
+      next_state = %{state | writes: state.writes ++ [{path, data}]}
+      {:reply, byte_size(data), Socket.put_state(socket, next_state)}
+    end
+  end
+
+  test "correlates out-of-order replies while independent reads run in parallel" do
+    pid = concurrent_server()
+
+    first =
+      Task.async(fn -> Exfuse.Server.dispatch(pid, v2_read_request(41, "/first"), :infinity) end)
+
+    second =
+      Task.async(fn -> Exfuse.Server.dispatch(pid, v2_read_request(42, "/second"), :infinity) end)
+
+    assert_receive {:read_started, "/first", first_worker}
+    assert_receive {:read_started, "/second", second_worker}
+
+    send(second_worker, :continue)
+
+    assert <<@magiccookie::32, 0x7632_0002::32, @request_read::32, 42::64, 0::32, "/second">> =
+             Task.await(second)
+
+    send(first_worker, :continue)
+
+    assert <<@magiccookie::32, 0x7632_0002::32, @request_read::32, 41::64, 0::32, "/first">> =
+             Task.await(first)
+  end
+
+  test "serializes stateful operations and preserves their state order" do
+    pid = concurrent_server()
+
+    first =
+      Task.async(fn ->
+        Exfuse.Server.dispatch(pid, v2_write_request(51, "/same", "a"), :infinity)
+      end)
+
+    assert_receive {:write_started, "/same", server}
+
+    second =
+      Task.async(fn ->
+        Exfuse.Server.dispatch(pid, v2_write_request(52, "/same", "b"), :infinity)
+      end)
+
+    refute_receive {:write_started, "/same", _}, 50
+
+    send(server, :continue)
+    assert_receive {:write_started, "/same", ^server}
+    send(server, :continue)
+    Task.await(first)
+    Task.await(second)
+
+    assert {_mount, ConcurrentFs, %{writes: [{"/same", "a"}, {"/same", "b"}]}, nil} =
+             Exfuse.Server.status(pid)
+  end
+
+  test "a crashed parallel worker returns EIO and releases queued stateful operations" do
+    pid = concurrent_server()
+
+    read =
+      Task.async(fn -> Exfuse.Server.dispatch(pid, v2_read_request(61, "/crash"), :infinity) end)
+
+    assert_receive {:read_started, "/crash", worker}
+
+    write =
+      Task.async(fn ->
+        Exfuse.Server.dispatch(pid, v2_write_request(62, "/after", "ok"), :infinity)
+      end)
+
+    refute_receive {:write_started, "/after", _}, 50
+    send(worker, :crash)
+
+    assert <<@magiccookie::32, 0x7632_0002::32, @request_read::32, 61::64, 5::32>> =
+             Task.await(read)
+
+    assert_receive {:write_started, "/after", server}
+    send(server, :continue)
+    Task.await(write)
+
+    assert {_mount, ConcurrentFs, %{writes: [{"/after", "ok"}]}, nil} =
+             Exfuse.Server.status(pid)
+  end
+
   test "server default backend is FSKit on macOS" do
     if :os.type() == {:unix, :darwin} do
       mount_point =
@@ -411,5 +510,35 @@ defmodule Exfuse.ServerProtocolTest do
     Port.close(port)
   catch
     :error, :badarg -> :ok
+  end
+
+  defp concurrent_server do
+    mount_point =
+      Path.join(System.tmp_dir!(), "exfuse-concurrent-#{System.unique_integer([:positive])}")
+
+    File.mkdir_p!(mount_point)
+    on_exit(fn -> File.rm_rf(mount_point) end)
+
+    start_supervised!(%{
+      id: {Exfuse.Server, mount_point},
+      start:
+        {Exfuse.Server, :start_link,
+         [
+           mount_point,
+           ConcurrentFs,
+           self(),
+           [backend: :fskit, wire_port: free_port(), max_concurrency: 2]
+         ]}
+    })
+  end
+
+  defp v2_read_request(id, path) do
+    <<@magiccookie::32, 0x7632_0002::32, @request_read::32, id::64, ctx()::binary,
+      read_payload(path, 0, 0, 0, 1024)::binary>>
+  end
+
+  defp v2_write_request(id, path, data) do
+    <<@magiccookie::32, 0x7632_0002::32, @request_write::32, id::64, ctx()::binary, 0::64, 0::64,
+      byte_size(path)::32, path::binary, data::binary>>
   end
 end

@@ -2,6 +2,7 @@ import Darwin
 import Foundation
 
 private let exfuseMagic: UInt32 = 0xC021_55AC
+private let exfuseProtocolV2: UInt32 = 0x7632_0002
 
 enum ExfuseRequest: UInt32 {
     case readdir = 3
@@ -40,8 +41,8 @@ struct ExfuseAttr {
 }
 
 final class ExfuseWireClient {
-    private let lock = NSLock()
-    private var fd: Int32 = -1
+    private let idLock = NSLock()
+    private var nextRequestID: UInt64 = 1
     private let port: UInt16
 
     init(port: UInt16) {
@@ -215,43 +216,50 @@ final class ExfuseWireClient {
     }
 
     private func request(_ request: ExfuseRequest, payload: Data) throws -> Data {
-        lock.lock()
-        defer { lock.unlock() }
-
-        try connectLocked()
+        let requestID = allocateRequestID()
+        let socketFD = try connect()
+        defer { close(socketFD) }
 
         var frame = Data()
         frame.appendUInt32(exfuseMagic)
+        frame.appendUInt32(exfuseProtocolV2)
         frame.appendUInt32(request.rawValue)
+        frame.appendUInt64(requestID)
         frame.appendUInt32(UInt32(getuid()))
         frame.appendUInt32(UInt32(getgid()))
         frame.appendUInt32(UInt32(getpid()))
         frame.appendUInt32(0)
         frame.append(payload)
 
-        try writeFrameLocked(frame)
-        let response = try readFrameLocked()
+        try writeFrame(frame, to: socketFD)
+        let response = try readFrame(from: socketFD)
 
-        guard response.count >= 12,
+        guard response.count >= 24,
               response.readUInt32(at: 0) == exfuseMagic,
-              response.readUInt32(at: 4) == request.rawValue
+              response.readUInt32(at: 4) == exfuseProtocolV2,
+              response.readUInt32(at: 8) == request.rawValue,
+              response.readUInt64(at: 12) == requestID
         else {
             throw posixError(EIO)
         }
 
-        let errno = response.readUInt32(at: 8)
+        let errno = response.readUInt32(at: 20)
         if errno != 0 {
             throw posixError(Int32(errno))
         }
 
-        return response.subdata(in: 12..<response.count)
+        return response.subdata(in: 24..<response.count)
     }
 
-    private func connectLocked() throws {
-        if fd >= 0 {
-            return
-        }
+    private func allocateRequestID() -> UInt64 {
+        idLock.lock()
+        defer { idLock.unlock() }
+        let value = nextRequestID
+        nextRequestID &+= 1
+        return value
+    }
 
+    private func connect() throws -> Int32 {
         let socketFD = socket(AF_INET, SOCK_STREAM, 0)
         guard socketFD >= 0 else {
             throw posixError(errno)
@@ -275,10 +283,10 @@ final class ExfuseWireClient {
             throw posixError(code)
         }
 
-        fd = socketFD
+        return socketFD
     }
 
-    private func writeFrameLocked(_ payload: Data) throws {
+    private func writeFrame(_ payload: Data, to fd: Int32) throws {
         var frame = Data()
         frame.appendUInt32(UInt32(payload.count))
         frame.append(payload)
@@ -292,7 +300,6 @@ final class ExfuseWireClient {
                 let result = Darwin.write(fd, base.advanced(by: written), buffer.count - written)
                 if result <= 0 {
                     let code = errno
-                    closeLocked()
                     throw posixError(code == 0 ? EIO : code)
                 }
                 written += result
@@ -300,17 +307,16 @@ final class ExfuseWireClient {
         }
     }
 
-    private func readFrameLocked() throws -> Data {
-        let header = try readExactlyLocked(4)
+    private func readFrame(from fd: Int32) throws -> Data {
+        let header = try readExactly(4, from: fd)
         let length = Int(header.readUInt32(at: 0))
         if length < 0 || length > 128 * 1024 * 1024 {
-            closeLocked()
             throw posixError(EIO)
         }
-        return try readExactlyLocked(length)
+        return try readExactly(length, from: fd)
     }
 
-    private func readExactlyLocked(_ count: Int) throws -> Data {
+    private func readExactly(_ count: Int, from fd: Int32) throws -> Data {
         var data = Data(count: count)
         try data.withUnsafeMutableBytes { buffer in
             guard let base = buffer.baseAddress else {
@@ -322,7 +328,6 @@ final class ExfuseWireClient {
                 let result = Darwin.read(fd, base.advanced(by: readCount), count - readCount)
                 if result <= 0 {
                     let code = errno
-                    closeLocked()
                     throw posixError(code == 0 ? EIO : code)
                 }
                 readCount += result
@@ -331,12 +336,6 @@ final class ExfuseWireClient {
         return data
     }
 
-    private func closeLocked() {
-        if fd >= 0 {
-            close(fd)
-            fd = -1
-        }
-    }
 }
 
 extension Data {

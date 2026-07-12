@@ -6,7 +6,9 @@ defmodule Exfuse.Server do
 
   use GenServer
   use Exfuse.Fs, attribs: true
+  require Logger
   alias Exfuse.Socket
+  @protocol_v2 0x7632_0002
 
   defstruct mount_point: nil,
             fs_mod: nil,
@@ -18,7 +20,11 @@ defmodule Exfuse.Server do
             port_os_pid: nil,
             listener: nil,
             fskit_resource: nil,
-            reply_to: nil
+            reply_to: nil,
+            request_id: nil,
+            max_concurrency: 8,
+            inflight: %{},
+            request_queue: :queue.new()
 
   @doc """
   Called by the `Exfuse.MountSup` supervisor, `start_link` starts an FS
@@ -106,7 +112,8 @@ defmodule Exfuse.Server do
         fs_state: fs_state,
         socket: socket,
         backend: :fuse,
-        port: port
+        port: port,
+        max_concurrency: System.schedulers_online()
       }
 
       case wait_for_port(port) do
@@ -133,7 +140,8 @@ defmodule Exfuse.Server do
         phase: :ready,
         backend: :fskit,
         listener: listener,
-        fskit_resource: Keyword.get(opts, :fskit_resource)
+        fskit_resource: Keyword.get(opts, :fskit_resource),
+        max_concurrency: Keyword.get(opts, :max_concurrency, System.schedulers_online())
       }
 
       {:ok, state}
@@ -157,17 +165,37 @@ defmodule Exfuse.Server do
     :undefined
   end
 
-  defp port_tx(data, %__MODULE__{reply_to: {:genserver_client, from}} = state) do
-    GenServer.reply(from, <<@magiccookie::size(32), data::binary>>)
+  defp port_tx(data, %__MODULE__{reply_to: {:capture, pid, ref}} = state) do
+    send(pid, {:captured_reply, ref, wire_reply(state, data)})
     state
   end
 
-  defp port_tx(data, %__MODULE__{port: port} = state) do
-    Port.command(port, <<@magiccookie::size(32), data::binary>>)
+  defp port_tx(data, %__MODULE__{reply_to: {:genserver_client, from}} = state) do
+    GenServer.reply(from, wire_reply(state, data))
+    state
+  end
+
+  defp port_tx(data, %__MODULE__{reply_to: {:port, port}} = state) do
+    Port.command(port, wire_reply(state, data))
     state
   catch
     :error, :badarg -> state
   end
+
+  defp port_tx(data, %__MODULE__{port: port} = state) do
+    Port.command(port, wire_reply(state, data))
+    state
+  catch
+    :error, :badarg -> state
+  end
+
+  defp wire_reply(%__MODULE__{request_id: nil}, data),
+    do: <<@magiccookie::size(32), data::binary>>
+
+  defp wire_reply(%__MODULE__{request_id: request_id}, <<code::size(32), rest::binary>>),
+    do:
+      <<@magiccookie::size(32), @protocol_v2::size(32), code::size(32), request_id::size(64),
+        rest::binary>>
 
   defp mount_point(pid) do
     case GenServer.call(pid, :status, 1_000) do
@@ -236,6 +264,160 @@ defmodule Exfuse.Server do
   end
 
   defp open_payload(handle) when is_integer(handle), do: <<handle::size(64)>>
+
+  defp route_request(state, code, request_id, data, destination) do
+    request = {code, request_id, data, destination}
+
+    cond do
+      parallel_code?(code) and map_size(state.inflight) < state.max_concurrency and
+          queue_empty?(state.request_queue) ->
+        {:noreply, start_parallel_request(state, request)}
+
+      map_size(state.inflight) == 0 and queue_empty?(state.request_queue) ->
+        {:noreply, run_serial_request(state, request)}
+
+      true ->
+        {:noreply, %{state | request_queue: :queue.in(request, state.request_queue)}}
+    end
+  end
+
+  defp start_parallel_request(state, {code, request_id, data, destination}) do
+    parent = self()
+    ref = make_ref()
+    base_socket = state.socket
+
+    {pid, monitor_ref} =
+      spawn_monitor(fn ->
+        worker_state = %{state | reply_to: {:capture, self(), ref}, request_id: request_id}
+        packet = <<@magiccookie::size(32), code::size(32), data::binary>>
+        {:noreply, completed} = handle_info({state.port, {:data, packet}}, worker_state)
+
+        receive do
+          {:captured_reply, ^ref, response} ->
+            send(parent, {:parallel_request_done, ref, response, completed.socket})
+        end
+      end)
+
+    entry = %{
+      base_socket: base_socket,
+      destination: destination,
+      code: code,
+      request_id: request_id,
+      pid: pid,
+      monitor_ref: monitor_ref
+    }
+
+    %{state | inflight: Map.put(state.inflight, ref, entry)}
+  end
+
+  defp run_serial_request(state, {code, request_id, data, destination}) do
+    packet = <<@magiccookie::size(32), code::size(32), data::binary>>
+    state = %{state | request_id: request_id, reply_to: destination}
+    {:noreply, state} = handle_info({state.port, {:data, packet}}, state)
+    %{state | request_id: nil, reply_to: nil}
+  end
+
+  defp drain_request_queue(state) do
+    case :queue.out(state.request_queue) do
+      {:empty, _queue} ->
+        state
+
+      {{:value, {code, _, _, _} = request}, queue}
+      when code in [@request_readdir, @request_getattr, @request_readlink, @request_read] and
+             map_size(state.inflight) < state.max_concurrency ->
+        state
+        |> Map.put(:request_queue, queue)
+        |> start_parallel_request(request)
+        |> drain_request_queue()
+
+      {{:value, request}, queue} when map_size(state.inflight) == 0 ->
+        state
+        |> Map.put(:request_queue, queue)
+        |> run_serial_request(request)
+        |> drain_request_queue()
+
+      _blocked ->
+        state
+    end
+  end
+
+  defp parallel_code?(code),
+    do: code in [@request_readdir, @request_getattr, @request_readlink, @request_read]
+
+  defp queue_empty?(queue), do: :queue.is_empty(queue)
+
+  defp send_wire_reply({:port, port}, response), do: Port.command(port, response)
+  defp send_wire_reply({:genserver_client, from}, response), do: GenServer.reply(from, response)
+
+  defp retry_response(
+         <<@magiccookie::size(32), @protocol_v2::size(32), code::size(32), request_id::size(64),
+           _status::size(32), _payload::binary>>
+       ) do
+    <<@magiccookie::size(32), @protocol_v2::size(32), code::size(32), request_id::size(64),
+      11::size(32)>>
+  end
+
+  defp error_response(code, request_id, errno) do
+    <<@magiccookie::size(32), @protocol_v2::size(32), code::size(32), request_id::size(64),
+      errno::size(32)>>
+  end
+
+  # Protocol v2 adds a request id after the operation code. Read-only requests
+  # may execute in bounded workers and therefore complete out of order. Stateful
+  # requests retain arrival ordering and wait for earlier reads to finish.
+  def handle_info(
+        {port,
+         {:data,
+          <<@magiccookie::size(32), @protocol_v2::size(32), code::size(32), request_id::size(64),
+            data::binary>>}},
+        %__MODULE__{port: port} = state
+      )
+      when code >= @request_readdir and code <= @request_fsync do
+    route_request(state, code, request_id, data, {:port, port})
+  end
+
+  def handle_info({:parallel_request_done, ref, response, worker_socket}, state) do
+    case Map.pop(state.inflight, ref) do
+      {nil, _inflight} ->
+        {:noreply, state}
+
+      {%{base_socket: base_socket, destination: destination, monitor_ref: monitor_ref}, inflight} ->
+        Process.demonitor(monitor_ref, [:flush])
+
+        {response, socket} =
+          if state.socket == base_socket do
+            {response, worker_socket}
+          else
+            # The callback returned state derived from an obsolete snapshot.
+            # EAGAIN prevents a successful reply from silently losing it.
+            {retry_response(response), state.socket}
+          end
+
+        send_wire_reply(destination, response)
+
+        state = %{state | inflight: inflight, socket: socket, fs_state: socket.state}
+        {:noreply, drain_request_queue(state)}
+    end
+  end
+
+  def handle_info({:DOWN, monitor_ref, :process, _pid, reason}, state) do
+    case Enum.find(state.inflight, fn {_ref, entry} -> entry.monitor_ref == monitor_ref end) do
+      nil ->
+        {:noreply, state}
+
+      {ref, entry} ->
+        Logger.error(
+          "Exfuse parallel request worker failed",
+          operation_code: entry.code,
+          request_id: entry.request_id,
+          reason: inspect(reason)
+        )
+
+        send_wire_reply(entry.destination, error_response(entry.code, entry.request_id, 5))
+        state = %{state | inflight: Map.delete(state.inflight, ref)}
+        {:noreply, drain_request_queue(state)}
+    end
+  end
 
   def handle_info(
         {port, {:data, <<@magiccookie::size(32), @request_readdir::size(32), data::binary>>}},
@@ -591,11 +773,19 @@ defmodule Exfuse.Server do
   end
 
   def handle_call({:wire_packet, packet}, from, %__MODULE__{} = state) do
-    state = %{state | reply_to: {:genserver_client, from}}
+    case packet do
+      <<@magiccookie::size(32), @protocol_v2::size(32), code::size(32), request_id::size(64),
+        data::binary>>
+      when code >= @request_readdir and code <= @request_fsync ->
+        route_request(state, code, request_id, data, {:genserver_client, from})
 
-    case handle_info({state.port, {:data, packet}}, state) do
-      {:noreply, state} -> {:noreply, %{state | reply_to: nil}}
-      {:stop, reason, state} -> {:stop, reason, %{state | reply_to: nil}}
+      _legacy ->
+        state = %{state | reply_to: {:genserver_client, from}}
+
+        case handle_info({state.port, {:data, packet}}, state) do
+          {:noreply, state} -> {:noreply, %{state | reply_to: nil}}
+          {:stop, reason, state} -> {:stop, reason, %{state | reply_to: nil}}
+        end
     end
   end
 

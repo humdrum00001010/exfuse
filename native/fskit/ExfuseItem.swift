@@ -26,8 +26,7 @@ final class ExfuseItem: FSItem {
         attrs.linkCount = 2
         attrs.fileID = .rootDirectory
         attrs.parentID = .parentOfRoot
-        attrs.uid = getuid()
-        attrs.gid = getgid()
+        attrs.flags = 0
         attrs.size = 0
         attrs.allocSize = 0
         attrs.modifyTime = currentTimespec()

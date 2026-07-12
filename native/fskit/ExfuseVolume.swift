@@ -22,11 +22,11 @@ final class ExfuseVolume: FSVolume {
     private var itemsByPath: [String: ExfuseItem] = [:]
     private let itemsLock = NSLock()
 
-    init(port: UInt16) {
+    init(port: UInt16, volumeUUID: UUID) {
         client = ExfuseWireClient(port: port)
 
         super.init(
-            volumeID: FSVolume.Identifier(uuid: Bundle.main.exfuseVolumeUUID),
+            volumeID: FSVolume.Identifier(uuid: volumeUUID),
             volumeName: FSFileName(string: "exfuse")
         )
     }
@@ -139,6 +139,7 @@ extension ExfuseVolume: FSVolume.Operations {
         }
 
         let path = try childPath(directory: directory, name: name)
+        log.notice("lookup \(path, privacy: .public)")
         return (try item(for: path), fileName(for: path))
     }
 
@@ -146,11 +147,11 @@ extension ExfuseVolume: FSVolume.Operations {
         log.debug("reclaimItem")
 
         if let item = item as? ExfuseItem {
-            itemsLock.lock()
-            if itemsByPath[item.path] === item {
-                itemsByPath.removeValue(forKey: item.path)
+            itemsLock.withLock {
+                if itemsByPath[item.path] === item {
+                    itemsByPath.removeValue(forKey: item.path)
+                }
             }
-            itemsLock.unlock()
         }
     }
 
@@ -219,11 +220,11 @@ extension ExfuseVolume: FSVolume.Operations {
             try client.unlink(item.path)
         }
 
-        itemsLock.lock()
-        if itemsByPath[item.path] === item {
-            itemsByPath.removeValue(forKey: item.path)
+        itemsLock.withLock {
+            if itemsByPath[item.path] === item {
+                itemsByPath.removeValue(forKey: item.path)
+            }
         }
-        itemsLock.unlock()
     }
 
     func renameItem(
@@ -245,17 +246,16 @@ extension ExfuseVolume: FSVolume.Operations {
         let destination = try childPath(directory: destinationDirectory, name: destinationName)
         try client.rename(from: source, to: destination)
 
-        itemsLock.lock()
-        itemsByPath.removeValue(forKey: source)
-        itemsByPath.removeValue(forKey: destination)
+        itemsLock.withLock {
+            itemsByPath.removeValue(forKey: source)
+            itemsByPath.removeValue(forKey: destination)
 
-        if let item = item as? ExfuseItem {
-            item.path = destination
-            item.name = fileName(for: destination)
-            itemsByPath[destination] = item
+            if let item = item as? ExfuseItem {
+                item.path = destination
+                item.name = fileName(for: destination)
+                itemsByPath[destination] = item
+            }
         }
-
-        itemsLock.unlock()
 
         return fileName(for: destination)
     }
@@ -328,8 +328,10 @@ extension ExfuseVolume: FSVolume.Operations {
         attrs.mode = attr.mode
         attrs.type = itemType(for: attr.kind)
         attrs.linkCount = attr.kind == .directory ? 2 : 1
-        attrs.uid = getuid()
-        attrs.gid = getgid()
+        // FSKit's standard item mask requires flags and excludes uid/gid.
+        // Supplying the latter while omitting flags makes FSKit reject the
+        // entire lookup as incomplete before a read can reach Exfuse.
+        attrs.flags = 0
         attrs.size = attr.size
         attrs.allocSize = attr.size
         attrs.fileID = itemID(for: path)
@@ -362,7 +364,13 @@ extension ExfuseVolume: FSVolume.OpenCloseOperations {
             throw posixError(EIO)
         }
 
-        _ = try client.open(path: item.path, flags: UInt32(modes.rawValue))
+        log.notice("open \(item.path, privacy: .public)")
+        do {
+            _ = try client.open(path: item.path, flags: UInt32(modes.rawValue))
+        } catch {
+            log.error("open failed for \(item.path, privacy: .public): \(String(describing: error), privacy: .public)")
+            throw error
+        }
     }
 
     func closeItem(_ item: FSItem, modes: FSVolume.OpenModes) async throws {
@@ -385,11 +393,20 @@ extension ExfuseVolume: FSVolume.ReadWriteOperations {
             throw posixError(EIO)
         }
 
-        let data = try client.read(
-            path: item.path,
-            offset: UInt64(max(offset, 0)),
-            size: UInt64(length)
-        )
+        log.notice("read \(item.path, privacy: .public) at \(offset) length \(length)")
+        let data: Data
+        do {
+            data = try client.read(
+                path: item.path,
+                offset: UInt64(max(offset, 0)),
+                size: UInt64(length)
+            )
+        } catch {
+            log.error(
+                "read failed for \(item.path, privacy: .public) at \(offset) length \(length): \(String(describing: error), privacy: .public)"
+            )
+            throw error
+        }
 
         return data.withUnsafeBytes { source in
             buffer.withUnsafeMutableBytes { destination in

@@ -79,9 +79,24 @@ defmodule Exfuse do
         {:ok, fskit_resource: %{device: resource, image: nil, owned: false}}
 
       true ->
-        port = Keyword.get(opts, :wire_port, 35_368)
-        {:ok, fskit_resource: %{device: "exfuse://127.0.0.1:#{port}", image: nil, owned: false}}
+        port = Keyword.get_lazy(opts, :wire_port, &available_wire_port!/0)
+        session = :crypto.strong_rand_bytes(12) |> Base.url_encode64(padding: false)
+
+        {:ok,
+         wire_port: port,
+         fskit_resource: %{
+           device: "exfuse://127.0.0.1:#{port}/?session=#{session}",
+           image: nil,
+           owned: false
+         }}
     end
+  end
+
+  defp available_wire_port! do
+    {:ok, socket} = :gen_tcp.listen(0, [:binary, ip: {127, 0, 0, 1}, active: false])
+    {:ok, port} = :inet.port(socket)
+    :ok = :gen_tcp.close(socket)
+    port
   end
 
   defp stop_mount_server(pid) do
