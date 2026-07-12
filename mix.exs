@@ -4,7 +4,7 @@ defmodule Exfuse.MixProject do
   def project do
     [
       app: :exfuse,
-      version: "0.1.0",
+      version: "0.1.1",
       elixir: "~> 1.20.1",
       start_permanent: Mix.env() == :prod,
       description: description(),
