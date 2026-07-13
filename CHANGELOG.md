@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Own the full mount lifecycle: one server per mount point (`{:error, {:already_mounted, pid}}` on a second mount, via a `Registry`), orphaned kernel mounts healed before remounting, transient FSKit "Resource busy" retried, and the mount verified against the OS mount table before `mount/4` returns (`verify: :mounted | :serving | false`), rolling back on failure.
+- Make `umount/1` idempotent (always `:ok`): stops every server at the point, waits for the kernel table to clear, then force-unmounts and drops the mount leaf — also reclaiming mounts orphaned by a host VM crash.
+- Add `mounted?/1` and `serving?/1` mount-health probes (external-process probing; in-beam `File.*` on an own-VM mount deadlocks the `:file_server`).
 - Fix FSKit item identity across rename-over-existing: `getattr`/`setattr`/`readdir` now report the pinned item ID instead of recomputing it from the current path, so a temp file renamed over an existing name keeps one consistent object identity.
 - Add wire client socket timeouts so a backend that accepts but never replies (protocol skew, wedged listener) fails bounded with ETIMEDOUT instead of blocking extension threads forever.
 - Reuse a fixed pool of wire connections per volume instead of dialing one ephemeral localhost connection per filesystem callback.

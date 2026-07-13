@@ -362,7 +362,7 @@ defmodule Exfuse.ServerProtocolTest do
     assert response == <<@magiccookie::32, 0x7632_0002::32, 0::32, 0::64, 5::32>>
   end
 
-  test "umount stops duplicate FSKit backend servers for the same mount point" do
+  test "a mount point admits exactly one server; umount stops it idempotently" do
     mount_point =
       Path.join(System.tmp_dir!(), "exfuse-fskit-duplicate-#{System.unique_integer([:positive])}")
 
@@ -376,14 +376,16 @@ defmodule Exfuse.ServerProtocolTest do
         fskit_resource: %{owned: false}
       )
 
-    {:ok, second} =
-      Exfuse.MountSup.start_child(mount_point, InitFs, :second,
-        backend: :fskit,
-        wire_port: free_port(),
-        fskit_resource: %{owned: false}
-      )
+    # The Registry makes the second server for the same point unstartable —
+    # duplicates are prevented at start, not just cleaned at umount.
+    assert {:error, {:already_started, ^first}} =
+             Exfuse.MountSup.start_child(mount_point, InitFs, :second,
+               backend: :fskit,
+               wire_port: free_port(),
+               fskit_resource: %{owned: false}
+             )
 
-    assert 2 ==
+    assert 1 ==
              Exfuse.list()
              |> Enum.count(fn
                {_pid, {^mount_point, InitFs, _state, nil}} -> true
@@ -391,12 +393,49 @@ defmodule Exfuse.ServerProtocolTest do
              end)
 
     first_ref = Process.monitor(first)
-    second_ref = Process.monitor(second)
 
-    assert {:ok, stopped} = Exfuse.umount(mount_point)
-    assert stopped in [first, second]
+    assert :ok = Exfuse.umount(mount_point)
     assert_receive {:DOWN, ^first_ref, :process, ^first, :normal}
-    assert_receive {:DOWN, ^second_ref, :process, ^second, :normal}
+
+    # Idempotent: unmounting an already-unmounted point is success.
+    assert :ok = Exfuse.umount(mount_point)
+  end
+
+  test "mount returns already_mounted for a point with a live server" do
+    mount_point =
+      Path.join(System.tmp_dir!(), "exfuse-fskit-exclusive-#{System.unique_integer([:positive])}")
+
+    File.mkdir_p!(mount_point)
+    on_exit(fn -> File.rm_rf(mount_point) end)
+
+    true_cmd = "/usr/bin/true"
+
+    assert {:ok, pid} =
+             Exfuse.mount(mount_point, InitFs, :state,
+               backend: :fskit,
+               mount_command: true_cmd,
+               verify: false,
+               wire_port: free_port()
+             )
+
+    assert {:error, {:already_mounted, ^pid}} =
+             Exfuse.mount(mount_point, InitFs, :state,
+               backend: :fskit,
+               mount_command: true_cmd,
+               verify: false,
+               wire_port: free_port()
+             )
+
+    assert :ok = Exfuse.umount(mount_point)
+  end
+
+  test "mounted?/serving? are false for an unmounted directory" do
+    dir = Path.join(System.tmp_dir!(), "exfuse-probe-#{System.unique_integer([:positive])}")
+    File.mkdir_p!(dir)
+    on_exit(fn -> File.rm_rf(dir) end)
+
+    refute Exfuse.mounted?(dir)
+    refute Exfuse.serving?(dir)
   end
 
   test "FSKit mount command timeout stops the backend server" do

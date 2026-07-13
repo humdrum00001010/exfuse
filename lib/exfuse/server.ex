@@ -34,7 +34,9 @@ defmodule Exfuse.Server do
   @spec start_link(String.t(), module, term) :: {:ok, pid} | {:error, term}
 
   def start_link(mount_point, fs_mod, fs_opts, opts \\ []) do
-    GenServer.start_link(__MODULE__, [mount_point, fs_mod, fs_opts, opts], [])
+    GenServer.start_link(__MODULE__, [mount_point, fs_mod, fs_opts, opts],
+      name: {:via, Registry, {Exfuse.Registry, mount_point}}
+    )
   end
 
   @doc """

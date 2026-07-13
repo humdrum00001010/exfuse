@@ -1,7 +1,27 @@
 defmodule Exfuse do
   @moduledoc """
   API calls to mount, and manage filesystems.
+
+  Exfuse assumes it owns its mount points: a path passed to `mount/4` must not
+  be mounted by anything else. Under that assumption the lifecycle is fully
+  managed here — one server per mount point (a second `mount/4` of the same
+  point returns `{:error, {:already_mounted, pid}}`), a mount left orphaned in
+  the kernel table by a crashed host VM is healed before remounting, transient
+  FSKit "Resource busy" failures are retried, the mount is verified against
+  the OS mount table before `mount/4` returns (rolled back if it never
+  arrives), and `umount/2` settles or force-cleans the mount leaf.
   """
+
+  # Transient FSKit "Resource busy" (a just-torn-down mount still settling):
+  # rerun mount(8) against the same live server/wire listener.
+  @busy_retries 12
+  @busy_retry_ms 300
+  # Post-mount verification poll (~2s total, matching the old best-effort
+  # settle wait — but failing the mount instead of shrugging).
+  @verify_tries 8
+  @verify_interval_ms 250
+  # How long umount/2 waits for the kernel table to clear before force-cleaning.
+  @umount_settle_ms 1_000
 
   @doc """
   Mount a filesystem. The three parameters are the mount point, the callback
@@ -14,6 +34,16 @@ defmodule Exfuse do
       iex> Exfuse.mount("/tmp/my_elixir_fs", MyApp.Filesystem, my_fs_opts)
       {:ok, #PID<0.194.0>}
 
+  Returns `{:error, {:already_mounted, pid}}` when this point already has a
+  live server.
+
+  The mount is verified before returning: by default `mount/4` polls the OS
+  mount table and rolls the server back with `{:error, :mount_not_visible}`
+  if the kernel mount never appears. Pass `verify: :serving` to additionally
+  require a successful directory read (see `serving?/1` — only for
+  filesystems whose root readdir succeeds), or `verify: false` to skip
+  verification (test stubs).
+
   Some example filesystems are provided which you can experiment with, and also
   inspect for improved understanding of how a filesystem is implemented.
   """
@@ -23,40 +53,109 @@ defmodule Exfuse do
   def mount(mount_point, fs_mod, fs_state, opts \\ []) do
     backend = Keyword.get(opts, :backend, backend())
 
-    case prepare_backend(mount_point, backend, opts) do
-      {:ok, backend_opts} ->
-        start_mount(mount_point, fs_mod, fs_state, backend, opts, backend_opts)
-
-      {:error, reason} ->
-        {:error, reason}
+    with {:ok, backend_opts} <- prepare_backend(mount_point, backend, opts),
+         :ok <- heal_mount_point(mount_point),
+         {:ok, pid} <- start_server(mount_point, fs_mod, fs_state, backend, opts, backend_opts) do
+      attach_and_verify(mount_point, pid, backend, opts, backend_opts)
     end
   end
 
-  defp start_mount(mount_point, fs_mod, fs_state, backend, opts, backend_opts) do
+  @doc """
+  Whether the mount point is present in the OS mount table (realpath-aware).
+  """
+  @spec mounted?(String.t()) :: boolean()
+  def mounted?(mount_point) when is_binary(mount_point) do
+    any_mounted?(mount_candidates(mount_point))
+  end
+
+  @doc """
+  Whether the mount point is in the OS mount table AND answers a directory
+  read. Probes with an external `ls` — never in-beam `File.*`: the filesystem
+  handlers run in this VM, so an in-beam file operation on the mount deadlocks
+  the global `:file_server`. A mount orphaned by a VM crash stays in the table
+  but fails this probe fast.
+
+  Only meaningful for filesystems whose root readdir succeeds.
+  """
+  @spec serving?(String.t()) :: boolean()
+  def serving?(mount_point) when is_binary(mount_point) do
+    mounted?(mount_point) and
+      match?({_out, 0}, System.cmd("ls", [mount_point], stderr_to_stdout: true))
+  rescue
+    _ -> false
+  catch
+    _, _ -> false
+  end
+
+  defp start_server(mount_point, fs_mod, fs_state, backend, opts, backend_opts) do
     server_opts =
       opts
       |> Keyword.merge(backend_opts)
       |> Keyword.put(:backend, backend)
 
-    case Exfuse.MountSup.start_child(
-           mount_point,
-           fs_mod,
-           fs_state,
-           server_opts
-         ) do
-      {:ok, pid} ->
-        case mount_backend(mount_point, backend, opts, backend_opts) do
-          :ok ->
-            {:ok, pid}
-
-          {:error, reason} ->
-            stop_mount_server(pid)
-            {:error, reason}
-        end
-
-      other ->
-        other
+    case Exfuse.MountSup.start_child(mount_point, fs_mod, fs_state, server_opts) do
+      {:error, {:already_started, pid}} -> {:error, {:already_mounted, pid}}
+      other -> other
     end
+  end
+
+  defp attach_and_verify(mount_point, pid, backend, opts, backend_opts) do
+    with :ok <- attach_backend(mount_point, backend, opts, backend_opts, @busy_retries),
+         :ok <- verify_mount(mount_point, opts) do
+      {:ok, pid}
+    else
+      {:error, reason} ->
+        stop_mount_server(pid)
+        force_clean_leaf(mount_point)
+        {:error, reason}
+    end
+  end
+
+  # A mount point still in the kernel table with NO live server in this VM is
+  # an orphan from a crashed host: any access EIOs, and mkdir/mount(8) over the
+  # dead node fail. Force-unmount and drop the leaf before mounting again.
+  defp heal_mount_point(mount_point) do
+    if Registry.lookup(Exfuse.Registry, mount_point) == [] and mounted?(mount_point) do
+      force_clean_leaf(mount_point)
+    end
+
+    :ok
+  end
+
+  defp verify_mount(mount_point, opts) do
+    case Keyword.get(opts, :verify, :mounted) do
+      false -> :ok
+      :mounted -> poll_verify(mount_point, &mounted?/1, :mount_not_visible)
+      :serving -> poll_verify(mount_point, &serving?/1, :mount_not_serving)
+    end
+  end
+
+  defp poll_verify(mount_point, probe, error), do: poll_verify(mount_point, probe, error, @verify_tries)
+
+  defp poll_verify(_mount_point, _probe, error, 0), do: {:error, error}
+
+  defp poll_verify(mount_point, probe, error, tries) do
+    if probe.(mount_point) do
+      :ok
+    else
+      Process.sleep(@verify_interval_ms)
+      poll_verify(mount_point, probe, error, tries - 1)
+    end
+  end
+
+  # Force-unmount and drop the mount LEAF only (rmdir refuses non-empty dirs,
+  # so real data is never touched); parents are the caller's business.
+  defp force_clean_leaf(mount_point) do
+    Enum.each(mount_candidates(mount_point), fn path ->
+      _ = System.cmd("umount", ["-f", path], stderr_to_stdout: true)
+    end)
+
+    _ = File.rmdir(mount_point)
+    :ok
+  rescue
+    _ -> :ok
+  catch
+    _, _ -> :ok
   end
 
   # The FUSE/libfuse backend serves non-mac systems only; macOS mounts through
@@ -113,12 +212,11 @@ defmodule Exfuse do
     :exit, :normal -> :ok
   end
 
-  defp mount_backend(mount_point, :fuse, _opts, _backend_opts) do
-    wait_until_mounted(mount_point)
-    :ok
-  end
+  # The FUSE port mounts on its own once the server is up; `verify_mount/2`
+  # owns waiting for the kernel table on both backends.
+  defp attach_backend(_mount_point, :fuse, _opts, _backend_opts, _retries), do: :ok
 
-  defp mount_backend(mount_point, :fskit, opts, backend_opts) do
+  defp attach_backend(mount_point, :fskit, opts, backend_opts, retries) do
     resource = backend_opts |> Keyword.fetch!(:fskit_resource) |> Map.fetch!(:device)
     File.mkdir_p!(mount_point)
 
@@ -128,7 +226,6 @@ defmodule Exfuse do
 
     case run_command(command, args, timeout) do
       {_out, 0} ->
-        wait_until_mounted(mount_point)
         :ok
 
       {:timeout, out} ->
@@ -138,7 +235,14 @@ defmodule Exfuse do
         {:error, {:fskit_mount_command_failed, reason}}
 
       {out, status} ->
-        {:error, {:fskit_mount_failed, status, String.trim(out)}}
+        # A just-torn-down mount can leave the point transiently busy; the
+        # server and its wire listener are untouched, so just rerun mount(8).
+        if retries > 0 and String.contains?(out, "Resource busy") do
+          Process.sleep(@busy_retry_ms)
+          attach_backend(mount_point, :fskit, opts, backend_opts, retries - 1)
+        else
+          {:error, {:fskit_mount_failed, status, String.trim(out)}}
+        end
     end
   end
 
@@ -219,29 +323,31 @@ defmodule Exfuse do
   end
 
   @doc """
-  Unmount a filesystem.
+  Unmount a filesystem. Idempotent: absent mounts are success.
 
       iex> Exfuse.umount("/tmp/my_elixir_fs")
-      {:ok, #PID<0.194.0>}
+      :ok
+
+  Stops every server registered at the point, waits briefly for the kernel
+  table to clear, and falls back to a force-unmount + leaf `rmdir` — which
+  also reclaims a mount orphaned by a VM crash, where no server exists but
+  the dead node still sits in the table.
   """
 
-  @spec umount(String.t()) :: {:ok, pid} | {:error, :not_mounted}
+  @spec umount(String.t()) :: :ok
 
   def umount(mount_point) do
-    case Enum.filter(
-           list(),
-           fn {_pid, {this_mount_point, _fs_mod, _fs_state, _os_pid}} ->
-             this_mount_point == mount_point
-           end
-         ) do
-      [] ->
-        {:error, :not_mounted}
+    list()
+    |> Enum.filter(fn {_pid, {this_mount_point, _fs_mod, _fs_state, _os_pid}} ->
+      this_mount_point == mount_point
+    end)
+    |> Enum.each(fn {pid, _status} -> stop_server(pid) end)
 
-      matches ->
-        pids = Enum.map(matches, fn {pid, _status} -> pid end)
-        Enum.each(pids, &stop_server/1)
-        {:ok, List.first(pids)}
+    unless settle_unmounted(mount_point) do
+      force_clean_leaf(mount_point)
     end
+
+    :ok
   end
 
   defp stop_server(pid) do
@@ -287,22 +393,22 @@ defmodule Exfuse do
     )
   end
 
-  defp wait_until_mounted(mount_point) do
-    deadline = System.monotonic_time(:millisecond) + 2_000
-    do_wait_until_mounted(mount_candidates(mount_point), deadline)
+  defp settle_unmounted(mount_point) do
+    deadline = System.monotonic_time(:millisecond) + @umount_settle_ms
+    do_settle_unmounted(mount_candidates(mount_point), deadline)
   end
 
-  defp do_wait_until_mounted(paths, deadline) do
+  defp do_settle_unmounted(paths, deadline) do
     cond do
-      mounted?(paths) ->
-        :ok
+      not any_mounted?(paths) ->
+        true
 
       System.monotonic_time(:millisecond) < deadline ->
-        Process.sleep(20)
-        do_wait_until_mounted(paths, deadline)
+        Process.sleep(50)
+        do_settle_unmounted(paths, deadline)
 
       true ->
-        :ok
+        false
     end
   end
 
@@ -325,7 +431,7 @@ defmodule Exfuse do
     end
   end
 
-  defp mounted?(paths) do
+  defp any_mounted?(paths) do
     case System.find_executable("mount") do
       nil ->
         true

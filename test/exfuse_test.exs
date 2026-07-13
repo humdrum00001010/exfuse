@@ -637,13 +637,16 @@ defmodule ExfuseTest do
       {:ok, mp: mp}
     end
 
-    test "returns successful unmount for mounted FS", %{mp: mp} do
+    test "unmounts a mounted FS and stops its server", %{mp: mp} do
       {:ok, pid} = Exfuse.mount(mp, TestFs, this: 2, that: 3)
-      assert {:ok, ^pid} = Exfuse.umount(mp)
+      ref = Process.monitor(pid)
+
+      assert :ok = Exfuse.umount(mp)
+      assert_receive {:DOWN, ^ref, :process, ^pid, :normal}
     end
 
-    test "returns error for not mounted FS", %{mp: mp} do
-      assert {:error, :not_mounted} = Exfuse.umount(mp)
+    test "is idempotent for a not-mounted point", %{mp: mp} do
+      assert :ok = Exfuse.umount(mp)
     end
   end
 
