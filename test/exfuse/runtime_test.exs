@@ -28,7 +28,7 @@ defmodule Exfuse.RuntimeTest do
 
   setup do
     {:ok, fs} = Exfuse.start_fs(ConcurrentFs, self(), max_concurrency: 2)
-    {:ok, file} = Exfuse.Fs.Runtime.root(fs)
+    {:ok, file} = Exfuse.Fs.Supervisor.root(fs)
     on_exit(fn -> if Process.alive?(fs), do: Exfuse.stop_fs(fs) end)
     %{fs: fs, root_file: file}
   end
@@ -44,6 +44,19 @@ defmodule Exfuse.RuntimeTest do
 
     assert {:reply, :a, _} = Task.await(first)
     assert {:reply, :b, _} = Task.await(second)
+  end
+
+  test "each Fs owns its File and Mount supervisors", %{fs: fs, root_file: root} do
+    file_supervisor = Exfuse.Fs.Supervisor.file_supervisor(fs)
+    mount_supervisor = Exfuse.Fs.Supervisor.mount_supervisor(fs)
+
+    assert Process.alive?(file_supervisor)
+    assert Process.alive?(mount_supervisor)
+
+    assert Enum.any?(DynamicSupervisor.which_children(file_supervisor), fn
+             {:undefined, ^root, :worker, [Exfuse.File]} -> true
+             _ -> false
+           end)
   end
 
   test "stateful operations are ordered", %{root_file: file} do

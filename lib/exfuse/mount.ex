@@ -9,6 +9,7 @@ defmodule Exfuse.Mount do
   @status 100
 
   defstruct fs: nil,
+            runtime: nil,
             root: nil,
             mount_point: nil,
             backend: nil,
@@ -19,7 +20,7 @@ defmodule Exfuse.Mount do
 
   def start_link(fs, mount_point, options) do
     GenServer.start_link(__MODULE__, {fs, mount_point, options},
-      name: {:via, Registry, {Exfuse.MountRegistry, mount_point}}
+      name: {:via, Registry, {Exfuse.Registry, {:mount, mount_point}}}
     )
   end
 
@@ -43,14 +44,21 @@ defmodule Exfuse.Mount do
   @impl true
   def init({fs, mount_point, options}) do
     backend = Keyword.fetch!(options, :backend)
+    runtime = Fs.Supervisor.runtime(fs)
 
-    with {:ok, root} <- Fs.Runtime.root(fs),
+    with {:ok, root} <- Fs.Runtime.root(runtime),
          {:ok, transport} <- start_transport(backend, root, mount_point, options),
-         :ok <- Fs.Runtime.register_mount(fs, self()) do
+         :ok <- Fs.Runtime.register_mount(runtime, self()) do
       {:ok,
        struct!(
          __MODULE__,
-         [fs: fs, root: root, mount_point: mount_point, backend: backend] ++ transport
+         [
+           fs: fs,
+           runtime: runtime,
+           root: root,
+           mount_point: mount_point,
+           backend: backend
+         ] ++ transport
        )}
     else
       {:error, reason} -> {:stop, reason}
@@ -108,7 +116,7 @@ defmodule Exfuse.Mount do
       do: GenServer.stop(state.listener)
 
     close_port(state.port)
-    Fs.Runtime.unregister_mount(state.fs, self())
+    Fs.Runtime.unregister_mount(state.runtime, self())
     :ok
   end
 

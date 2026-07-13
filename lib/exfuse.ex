@@ -10,7 +10,7 @@ defmodule Exfuse do
     Exfuse.FsSupervisor.start_fs(module, init_arg, options)
   end
 
-  def stop_fs(fs) when is_pid(fs), do: Exfuse.Fs.Runtime.stop(fs)
+  def stop_fs(fs) when is_pid(fs), do: Exfuse.FsSupervisor.stop_fs(fs)
 
   def mount(fs, mount_point, options \\ []) when is_pid(fs) and is_binary(mount_point) do
     mount_point = Path.expand(mount_point)
@@ -51,22 +51,23 @@ defmodule Exfuse do
   end
 
   def list do
-    Exfuse.MountSupervisor.mounts()
+    Exfuse.FsSupervisor.filesystems()
     |> Enum.flat_map(fn
-      {:undefined, pid, :worker, [Exfuse.Mount]} ->
-        try do
-          [{pid, Exfuse.Mount.status(pid)}]
-        catch
-          :exit, _ -> []
-        end
+      {:undefined, fs, :supervisor, [Exfuse.Fs.Supervisor]} ->
+        fs
+        |> Exfuse.Fs.Supervisor.mount_supervisor()
+        |> Exfuse.MountSupervisor.mounts()
 
       _ ->
         []
     end)
+    |> Enum.flat_map(&mount_status/1)
   end
 
   defp start_mount(fs, mount_point, options) do
-    case Exfuse.MountSupervisor.start_mount(fs, mount_point, options) do
+    supervisor = Exfuse.Fs.Supervisor.mount_supervisor(fs)
+
+    case Exfuse.MountSupervisor.start_mount(supervisor, fs, mount_point, options) do
       {:error, {:already_started, pid}} -> {:error, {:already_mounted, pid}}
       other -> other
     end
@@ -85,7 +86,7 @@ defmodule Exfuse do
   end
 
   defp heal_mount_point(mount_point) do
-    if Registry.lookup(Exfuse.MountRegistry, mount_point) == [] and mounted?(mount_point) do
+    if Registry.lookup(Exfuse.Registry, {:mount, mount_point}) == [] and mounted?(mount_point) do
       force_clean_leaf(mount_point)
     end
 
@@ -312,4 +313,14 @@ defmodule Exfuse do
     :ok = :gen_tcp.close(socket)
     port
   end
+
+  defp mount_status({:undefined, pid, :worker, [Exfuse.Mount]}) do
+    try do
+      [{pid, Exfuse.Mount.status(pid)}]
+    catch
+      :exit, _ -> []
+    end
+  end
+
+  defp mount_status(_child), do: []
 end

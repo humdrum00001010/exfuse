@@ -7,10 +7,8 @@ defmodule Exfuse.App do
 
   def start(_type, _args) do
     children = [
-      {Registry, keys: :unique, name: Exfuse.MountRegistry},
+      {Registry, keys: :unique, name: Exfuse.Registry},
       Exfuse.FsSupervisor,
-      Exfuse.FileSupervisor,
-      Exfuse.MountSupervisor,
       {Task.Supervisor, name: Exfuse.RequestSupervisor}
     ]
 

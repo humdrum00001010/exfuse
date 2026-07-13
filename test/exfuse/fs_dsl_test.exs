@@ -66,7 +66,7 @@ defmodule Exfuse.FsDslTest do
 
   test "one File process serves every parameter value of a plug declaration" do
     {:ok, fs} = Exfuse.start_fs(PlugFs, self())
-    {:ok, root} = Exfuse.Fs.Runtime.root(fs)
+    {:ok, root} = Exfuse.Fs.Supervisor.root(fs)
 
     assert {:reply, "a", _socket} = File.dispatch(root, :read, %{path: "/items/a"})
     assert_receive {:plug_init, plug}
@@ -76,7 +76,7 @@ defmodule Exfuse.FsDslTest do
     assert_receive {:plug_read, ^plug, "b"}
     refute_receive {:plug_init, _other}, 25
 
-    assert %{files: files} = Exfuse.Fs.Runtime.status(fs)
+    assert %{files: files} = Exfuse.Fs.Supervisor.status(fs)
     assert length(files) == 2
     Exfuse.stop_fs(fs)
   end

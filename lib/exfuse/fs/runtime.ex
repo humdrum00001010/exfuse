@@ -8,6 +8,7 @@ defmodule Exfuse.Fs.Runtime do
   defstruct module: nil,
             init_arg: nil,
             options: [],
+            file_supervisor: nil,
             files: nil,
             root: nil,
             mounts: MapSet.new()
@@ -40,7 +41,8 @@ defmodule Exfuse.Fs.Runtime do
   @impl true
   def init({module, init_arg, options}) do
     files = :ets.new(__MODULE__, [:set, :protected, read_concurrency: true])
-    runtime = %{owner: self(), files: files}
+    file_supervisor = Keyword.fetch!(options, :file_supervisor)
+    runtime = %{owner: self(), files: files, file_supervisor: file_supervisor}
 
     case start_file(:root, module, init_arg, runtime, options) do
       {:ok, root} ->
@@ -52,6 +54,7 @@ defmodule Exfuse.Fs.Runtime do
            module: module,
            init_arg: init_arg,
            options: options,
+           file_supervisor: file_supervisor,
            files: files,
            root: root
          }}
@@ -80,7 +83,11 @@ defmodule Exfuse.Fs.Runtime do
         {:reply, {:ok, file}, state}
 
       :error ->
-        runtime = %{owner: self(), files: state.files}
+        runtime = %{
+          owner: self(),
+          files: state.files,
+          file_supervisor: state.file_supervisor
+        }
 
         case start_file(declaration, module, state.init_arg, runtime, state.options) do
           {:ok, file} ->
@@ -139,6 +146,7 @@ defmodule Exfuse.Fs.Runtime do
 
   defp start_file(key, module, init_arg, runtime, options) do
     FileSupervisor.start_file(
+      runtime.file_supervisor,
       key: {self(), key},
       module: module,
       init_arg: init_arg,

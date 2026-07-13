@@ -5,15 +5,19 @@
 Exfuse now separates a logical filesystem from its native attachments:
 
 ```text
-Fs.Runtime
-├── File (root callback state)
-├── File (one per plug declaration, started lazily)
-├── Mount (FSKit attachment)
-└── Mount (Linux FUSE attachment)
+Fs.Supervisor
+├── FileSupervisor
+│   ├── File (root callback state)
+│   └── File (one per plug declaration, started lazily)
+├── MountSupervisor
+│   ├── Mount (FSKit attachment)
+│   └── Mount (Linux FUSE attachment)
+└── Fs.Runtime (namespace and routing state)
 ```
 
-`Fs.Runtime` owns one namespace and can be attached at multiple mount points.
-`File` owns callback state and request scheduling. `Mount` owns only the native
+The `fs` PID returned by `Exfuse.start_fs/3` is this per-filesystem supervisor.
+Its file and mount children are not shared with another filesystem. `File`
+owns callback state and request scheduling. `Mount` owns only the native
 transport and mount lifecycle. FSKit and Linux FUSE decode into the same normal
 operation and call the same `File` process.
 
