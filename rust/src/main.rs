@@ -13,7 +13,7 @@ use std::thread;
 use std::time::Duration;
 
 const MAGIC: u32 = 0xC021_55AC;
-const PROTOCOL_V2: u32 = 0x7632_0002;
+const PROTOCOL_V3: u32 = 0x7633_0003;
 
 #[repr(u32)]
 #[derive(Clone, Copy)]
@@ -694,18 +694,37 @@ unsafe extern "C" fn fuse_readdir(
     match with_port(|port| port.readdir(path)) {
         Ok(entries) => {
             let start = offset.max(0) as usize;
+            let total = entries.len() + 2;
 
-            for (index, entry) in [".", ".."]
-                .iter()
-                .copied()
-                .chain(entries.iter().map(String::as_str))
-                .enumerate()
-                .skip(start)
-            {
+            for index in start..total {
+                let (entry, attr) = match index {
+                    0 => (".", None),
+                    1 => ("..", None),
+                    _ => {
+                        let entry = &entries[index - 2];
+                        (entry.name.as_str(), Some(&entry.attr))
+                    }
+                };
+
                 if let Ok(name) = CString::new(entry) {
                     let next_offset = (index + 1) as libc::off_t;
+                    let mut stat: libc::stat = unsafe { mem::zeroed() };
+                    let stat_ptr = if let Some(attr) = attr {
+                        stat.st_mode = attr.mode;
+                        stat.st_nlink = attr.nlink;
+                        stat.st_size = attr.size;
+                        stat.st_blocks = (attr.size + 511) / 512;
+                        if let Some(mtime) = attr.mtime {
+                            stat.st_mtime = mtime;
+                            stat.st_ctime = mtime;
+                        }
+                        &stat as *const libc::stat
+                    } else {
+                        ptr::null()
+                    };
+
                     unsafe {
-                        if filler(buf, name.as_ptr(), ptr::null(), next_offset) != 0 {
+                        if filler(buf, name.as_ptr(), stat_ptr, next_offset) != 0 {
                             break;
                         }
                     }
@@ -873,6 +892,11 @@ struct Attr {
     mtime: Option<i64>,
 }
 
+struct DirectoryEntry {
+    name: String,
+    attr: Attr,
+}
+
 struct RequestContext {
     uid: u32,
     gid: u32,
@@ -932,7 +956,7 @@ impl Port {
             while let Ok(response) = read_packet(&mut input) {
                 if response.len() < 24
                     || read_u32(&response[0..4]) != MAGIC
-                    || read_u32(&response[4..8]) != PROTOCOL_V2
+                    || read_u32(&response[4..8]) != PROTOCOL_V3
                 {
                     continue;
                 }
@@ -962,42 +986,45 @@ impl Port {
         let response = self.request(Message::Getattr, path.as_bytes())?;
         let data = response.ok()?;
 
-        if data.len() != 12 && data.len() != 20 {
+        decode_attr(&data)
+    }
+
+    fn readdir(&self, path: &str) -> Result<Vec<DirectoryEntry>, c_int> {
+        let response = self.request(Message::Readdir, path.as_bytes())?;
+        let data = response.ok()?;
+        if data.len() < 4 {
             return Err(libc::EIO);
         }
 
-        let mode = read_u32(&data[0..4]);
-        let kind = NodeKind::from_wire(read_u32(&data[4..8])).ok_or(libc::EIO)?;
-        let kind_mode = kind.fuse_mode();
-        let size = read_u32(&data[8..12]) as libc::off_t;
+        let count = read_u32(&data[0..4]) as usize;
+        let mut offset = 4;
+        let mut entries = Vec::with_capacity(count);
 
-        // Extended attr form: a trailing u64 mtime lets content-projection
-        // filesystems signal content changes for kernel cache revalidation.
-        let mtime = if data.len() == 20 {
-            let mut raw = [0u8; 8];
-            raw.copy_from_slice(&data[12..20]);
-            Some(i64::from_be_bytes(raw))
-        } else {
-            None
-        };
+        for _ in 0..count {
+            let name_bytes = take_length_prefixed(&data, &mut offset)?;
+            let attr_bytes = take_length_prefixed(&data, &mut offset)?;
+            let name = std::str::from_utf8(name_bytes).map_err(|_| libc::EIO)?;
 
-        Ok(Attr {
-            mode: kind_mode | ((mode & 0o7777) as libc::mode_t),
-            nlink: if matches!(kind, NodeKind::Dir) { 2 } else { 1 },
-            size,
-            mtime,
-        })
-    }
+            if name.is_empty()
+                || name == "."
+                || name == ".."
+                || name.contains('/')
+                || name.as_bytes().contains(&0)
+            {
+                return Err(libc::EIO);
+            }
 
-    fn readdir(&self, path: &str) -> Result<Vec<String>, c_int> {
-        let response = self.request(Message::Readdir, path.as_bytes())?;
-        let data = response.ok()?;
+            entries.push(DirectoryEntry {
+                name: name.to_owned(),
+                attr: decode_attr(attr_bytes)?,
+            });
+        }
 
-        Ok(data
-            .split(|byte| *byte == 0)
-            .filter(|entry| !entry.is_empty())
-            .map(|entry| String::from_utf8_lossy(entry).into_owned())
-            .collect())
+        if offset != data.len() {
+            return Err(libc::EIO);
+        }
+
+        Ok(entries)
     }
 
     fn readlink(&self, path: &str) -> Result<String, c_int> {
@@ -1140,7 +1167,7 @@ impl Port {
         let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
         let mut packet = Vec::with_capacity(32 + payload.len());
         packet.extend_from_slice(&MAGIC.to_be_bytes());
-        packet.extend_from_slice(&PROTOCOL_V2.to_be_bytes());
+        packet.extend_from_slice(&PROTOCOL_V3.to_be_bytes());
         packet.extend_from_slice(&code.to_be_bytes());
         packet.extend_from_slice(&request_id.to_be_bytes());
         RequestContext::current().write_to(&mut packet);
@@ -1164,7 +1191,7 @@ impl Port {
         }
 
         if read_u32(&response[0..4]) != MAGIC
-            || read_u32(&response[4..8]) != PROTOCOL_V2
+            || read_u32(&response[4..8]) != PROTOCOL_V3
             || read_u32(&response[8..12]) != code
             || read_u64(&response[12..20]) != request_id
         {
@@ -1272,6 +1299,46 @@ fn read_u32(bytes: &[u8]) -> u32 {
 
 fn read_u64(bytes: &[u8]) -> u64 {
     u64::from_be_bytes(bytes.try_into().expect("slice is exactly 8 bytes"))
+}
+
+fn decode_attr(data: &[u8]) -> Result<Attr, c_int> {
+    if data.len() != 16 && data.len() != 24 {
+        return Err(libc::EIO);
+    }
+
+    let mode = read_u32(&data[0..4]);
+    let kind = NodeKind::from_wire(read_u32(&data[4..8])).ok_or(libc::EIO)?;
+    let kind_mode = kind.fuse_mode();
+    let size = i64::try_from(read_u64(&data[8..16])).map_err(|_| libc::EOVERFLOW)?;
+    let mtime = if data.len() == 24 {
+        Some(i64::try_from(read_u64(&data[16..24])).map_err(|_| libc::EOVERFLOW)?)
+    } else {
+        None
+    };
+
+    Ok(Attr {
+        mode: kind_mode | ((mode & 0o7777) as libc::mode_t),
+        nlink: if matches!(kind, NodeKind::Dir) { 2 } else { 1 },
+        size: size as libc::off_t,
+        mtime,
+    })
+}
+
+fn take_length_prefixed<'a>(data: &'a [u8], offset: &mut usize) -> Result<&'a [u8], c_int> {
+    if data.len().saturating_sub(*offset) < 4 {
+        return Err(libc::EIO);
+    }
+
+    let length = read_u32(&data[*offset..*offset + 4]) as usize;
+    *offset += 4;
+    let end = offset.checked_add(length).ok_or(libc::EIO)?;
+    if end > data.len() {
+        return Err(libc::EIO);
+    }
+
+    let value = &data[*offset..end];
+    *offset = end;
+    Ok(value)
 }
 
 fn errno(code: u32) -> c_int {

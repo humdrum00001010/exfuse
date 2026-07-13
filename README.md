@@ -2,129 +2,12 @@
 
 Elixir filesystem routing over native user-space filesystem backends.
 
-The native bridge is the Rust port `exfuse_port` under `rust`. Mix builds it
-and copies it to `priv/exfuse_port`. It is not a NIF.
-
-Set `EXFUSE_PORT=/path/to/exfuse_port` to override the port executable.
-
-## Backends
-
-Backend selection is by OS: macOS mounts through the FSKit extension, and
-every other Unix mounts through the FUSE/libfuse Rust port. There is no
-macFUSE backend — on macOS the port binary is not even built, so neither
-cargo nor macFUSE is needed there. The FSKit implementation lives under
-`native/fskit`:
-
-- `ExfuseFSKitExtension.swift` is the FSKit `UnaryFileSystemExtension`
-  entrypoint.
-- `ExfuseVolume.swift` maps FSKit volume operations onto the existing exfuse
-  filesystem operation set.
-- `ExfuseWire.swift` speaks the existing exfuse framed request protocol over a
-  localhost socket, so Elixir filesystem modules do not need a new callback API.
-- `Exfuse.WireListener` receives that same framed protocol over TCP and
-  dispatches it through `Exfuse.Server`.
-
-Check SDK/API compatibility with:
-
-```sh
-mix exfuse.fskit.check
-```
-
-Build a local host app with the embedded FSKit `.appex`. Because the FSKit
-module entitlement is restricted, the runnable bundle must be signed with a
-trusted Apple code-signing identity (`Apple Development`, `Mac Developer`, or
-`Developer ID Application`). The task auto-selects one from Keychain when
-available:
-
-```sh
-mix exfuse.fskit.bundle
-```
-
-You can also pass the identity explicitly:
-
-```sh
-mix exfuse.fskit.bundle --sign "Apple Development: Your Name (TEAMID)"
-```
-
-For compile/package checks only, opt into a non-runnable ad-hoc bundle:
-
-```sh
-mix exfuse.fskit.bundle --allow-adhoc
-```
-
-Build, sign, install, register, and elect the app extension for local testing
-in one command:
-
-```sh
-mix exfuse.fskit.install --build --sign "Apple Development: Your Name (TEAMID)"
-```
-
-or, when a preferred Apple identity is already in Keychain:
-
-```sh
-mix exfuse.fskit.install --build
-```
-
-macOS still requires the user approval toggle after registration:
-
-```text
-System Settings > General > Login Items & Extensions > File System Extensions
-```
-
-Enable `exfuse` there. If that toggle is still off, FSKit rejects the mount with
-`Module org.exfuse.fskit.extension is disabled!`.
-
-After approval, `Exfuse.mount/4` on macOS uses FSKit automatically.
-
-## Build
-
-Tool versions live in `.mise.toml`: Elixir 1.20.1 on OTP 29.
-
-```sh
-mise install
-mise exec -- mix deps.get
-mise exec -- mix compile
-```
-
-Portable tests run by default:
-
-```sh
-mise exec -- mix test
-```
-
-Real mount tests require a working FUSE installation and are opt-in:
-
-```sh
-EXFUSE_RUN_FUSE_TESTS=1 mise exec -- mix test --only fuse
-```
-
-## Hex
-
-Package metadata lives in `mix.exs`. The Hex package includes the Elixir source
-and the Rust bridge source; generated binaries and build outputs are excluded.
-
-Verify the package:
-
-```sh
-mise exec -- mix hex.build --unpack
-mise exec -- mix hex.publish --dry-run
-```
-
-Publish with:
-
-```sh
-mise exec -- mix hex.publish
-```
-
-## License
-
-MIT.
+Exfuse runs one logical filesystem independently of its native mount points.
+macOS uses FSKit; Linux and other supported Unix systems use the Rust
+FUSE/libfuse port. Both adapters speak the same strict v3 protocol and invoke
+the same Elixir callbacks.
 
 ## Filesystem API
-
-`Exfuse.mount/3` mounts one filesystem process at a mount point. Everything
-below that mount point is served by the filesystem module through FUSE
-operations like `readdir`, `getattr`, `open`, and `read`.
 
 ```elixir
 defmodule DocsFs do
@@ -134,86 +17,49 @@ defmodule DocsFs do
     opts
   end
 
-  readdir "/*" do
-    case Map.fetch(state, event.path) do
-      {:ok, {:dir, entries}} -> {:reply, entries, socket}
-      _ -> {:error, :enoent, socket}
-    end
+  readdir "/" do
+    {:reply,
+     [
+       {"README.md", attr(type: :file, size: byte_size(state.readme))},
+       {"docs", attr(type: :dir)}
+     ], socket}
   end
 
-  getattr "/*" do
-    case Map.fetch(state, event.path) do
-      {:ok, {:dir, _entries}} -> {:reply, dir(), socket}
-      {:ok, {:file, data}} -> {:reply, file(size: byte_size(data)), socket}
-      :error -> {:error, :enoent, socket}
-    end
+  getattr "/" do
+    {:reply, attr(type: :dir), socket}
   end
 
-  open "/*" do
-    case Map.fetch(state, event.path) do
-      {:ok, {:file, _data}} -> {:noreply, socket}
-      {:ok, {:dir, _entries}} -> {:error, :eisdir, socket}
-      _ -> {:error, :enoent, socket}
-    end
+  getattr "/README.md" do
+    {:reply, attr(type: :file, size: byte_size(state.readme)), socket}
   end
 
-  read "/*" do
-    case Map.fetch(state, event.path) do
-      {:ok, {:file, data}} ->
-        {:reply, slice(data, event.offset, event.size), socket}
-
-      {:ok, {:dir, _entries}} ->
-        {:error, :eisdir, socket}
-
-      :error ->
-        {:error, :enoent, socket}
-    end
-  end
-
-  defp slice(data, offset, size) do
-    start = min(offset, byte_size(data))
-    count = min(size, byte_size(data) - start)
-    binary_part(data, start, count)
+  read "/README.md" do
+    start = min(event.offset, byte_size(state.readme))
+    size = min(event.size, byte_size(state.readme) - start)
+    {:reply, binary_part(state.readme, start, size), socket}
   end
 end
+
+{:ok, fs} = Exfuse.start_fs(DocsFs, %{readme: "hello\n"})
+{:ok, mount} = Exfuse.mount(fs, "/tmp/docsfs")
+
+:ok = Exfuse.unmount(mount)
+:ok = Exfuse.stop_fs(fs)
 ```
 
-Mount a tree:
+One `fs` can be attached to multiple mount points. `readdir` always returns
+`{name, attributes}` pairs; this lets FSKit and FUSE fill ordinary directory
+entries without issuing one `getattr` callback per child.
+
+`attr/1` is the single attribute constructor:
 
 ```elixir
-{:ok, _pid} =
-  Exfuse.mount("/tmp/docsfs", DocsFs, %{
-    "/" => {:dir, ["README.md", "docs"]},
-    "/README.md" => {:file, "readme\n"},
-    "/docs" => {:dir, ["intro.txt", "api"]},
-    "/docs/intro.txt" => {:file, "intro\n"},
-    "/docs/api" => {:dir, ["mount.txt"]},
-    "/docs/api/mount.txt" => {:file, "mount\n"}
-  })
+attr(type: :dir)
+attr(type: :file, size: 1_024, mtime: 1_720_000_000)
+attr(type: :symlink, size: 9)
 ```
 
-The mounted tree is searchable like a normal filesystem:
-
-```sh
-cd /tmp/docsfs
-find .
-# .
-# ./README.md
-# ./docs
-# ./docs/intro.txt
-# ./docs/api
-# ./docs/api/mount.txt
-```
-
-Unmount with the OS tool or with:
-
-```elixir
-Exfuse.umount("/tmp/docsfs")
-```
-
-## Route Patterns
-
-Route patterns:
+Route patterns bind path values:
 
 ```elixir
 read "/docs/:file" do
@@ -224,164 +70,104 @@ read "/docs/*path" do
   {:reply, Enum.join(path, "/"), socket}
 end
 
-plug "/docs/:file", DocsFile
+plug "/topics/:id", TopicFile
 ```
 
-`:name` binds one path segment as a binary. `*name` binds the remaining path
-tail as a list of segments. Bare `*` matches the remaining path tail without
-binding it.
+Each `plug` declaration owns one persistent `Exfuse.File` process. Parameter
+values are carried in `event.params`; they do not create processes.
 
-Inside a route block:
-
-- `socket` is the long-lived mount session.
-- `state` is `socket.state`.
-- `event` is the current FUSE operation payload.
-- route params are local variables, not socket fields.
-
-`plug/2` delegates every matching operation packet to an endpoint process.
-Processes are keyed by route params, so repeated packets for `/docs/a` reuse
-one process while `/docs/b` gets another.
+For full control, implement `exfuse_init/1` and `handle_event/3` directly:
 
 ```elixir
-defmodule DocsFile do
-  def init(socket) do
-    {:ok, socket}
+defmodule ManualFs do
+  @behaviour Exfuse.Fs
+  import Exfuse.Fs, only: [attr: 1]
+
+  def exfuse_init(service), do: {:ok, service}
+
+  def handle_event(:readdir, %{path: "/"}, socket) do
+    entries = Enum.map(Service.list(socket.state), fn %{name: name, size: size} ->
+      {name, attr(type: :file, size: size)}
+    end)
+
+    {:reply, entries, socket}
   end
 
-  def handle_event(:getattr, %{params: %{file: file}}, socket) do
-    {:reply, Exfuse.Fs.file(size: byte_size(file)), socket}
-  end
-
-  def handle_event(:read, %{params: %{file: file}} = event, socket) do
-    {:reply, read_file(file, event.offset, event.size), socket}
-  end
-
-  def handle_event(_op, _event, socket) do
-    {:error, :enoent, socket}
-  end
+  def handle_event(operation, _event, socket),
+    do: {:error, if(operation == :write, do: :erofs, else: :enoent), socket}
 end
 ```
 
-Plug params live in `event.params`; the socket is still only the long-lived
-session held by that endpoint process.
-
-Return Channel-style tuples:
+Callbacks return Channel-style tuples:
 
 ```elixir
-{:reply, reply, socket}
+{:reply, value, socket}
 {:noreply, socket}
 {:error, reason, socket}
 ```
 
-Known error atoms include `:enoent`, `:eperm`, `:eio`, `:eacces`, `:eexist`,
-`:enotdir`, `:eisdir`, `:einval`, `:enospc`, `:erofs`, and `:enosys`.
+Read operations run concurrently from an immutable state snapshot. Stateful
+operations run in arrival order. The event map always includes `path`,
+`mount_point`, `uid`, `gid`, `pid`, and `umask`, plus operation-specific fields.
 
-## Manual API
+The detailed execution and wire design is in
+[`docs/backend-neutral-filesystem-ir.md`](docs/backend-neutral-filesystem-ir.md).
 
-For full control, implement `handle_event/3` directly.
+## Backends
 
-```elixir
-defmodule ManualDocsFs do
-  use Exfuse.Fs
+The Rust port lives under `rust`. It is a Port executable, not a NIF. Set
+`EXFUSE_PORT=/path/to/exfuse_port` to override its location.
 
-  def exfuse_init(mount_point, docs) do
-    {:ok, %{mount_point: mount_point, docs: docs}}
-  end
+The FSKit implementation lives under `native/fskit`. It uses a pool of 16
+persistent localhost connections to preserve concurrent FSKit callbacks.
 
-  def handle_event(:readdir, %{path: "/"}, socket) do
-    {:reply, Map.keys(socket.state.docs), socket}
-  end
+Check SDK compatibility:
 
-  def handle_event(:getattr, %{path: "/"}, socket) do
-    {:reply, dir(), socket}
-  end
-
-  def handle_event(:getattr, %{path: "/" <> file}, socket) do
-    case Map.fetch(socket.state.docs, file) do
-      {:ok, data} -> {:reply, file(size: byte_size(data)), socket}
-      :error -> {:error, :enoent, socket}
-    end
-  end
-
-  def handle_event(:open, %{path: "/" <> file}, socket) do
-    if Map.has_key?(socket.state.docs, file) do
-      {handle, socket} = Exfuse.Socket.new_handle(socket, file)
-      {:reply, handle, socket}
-    else
-      {:error, :enoent, socket}
-    end
-  end
-
-  def handle_event(:read, %{handle: handle, offset: offset, size: size}, socket) do
-    with {:ok, file} <- Exfuse.Socket.fetch_handle(socket, handle),
-         {:ok, data} <- Map.fetch(socket.state.docs, file) do
-      {:reply, slice(data, offset, size), socket}
-    else
-      :error -> {:error, :enoent, socket}
-    end
-  end
-
-  def handle_event(:release, %{handle: handle}, socket) do
-    {:noreply, Exfuse.Socket.delete_handle(socket, handle)}
-  end
-
-  def handle_event(_op, _event, socket) do
-    {:error, :enoent, socket}
-  end
-
-  defp slice(data, offset, size) do
-    start = min(offset, byte_size(data))
-    count = min(size, byte_size(data) - start)
-    binary_part(data, start, count)
-  end
-end
+```sh
+mix exfuse.fskit.check
 ```
 
-`%Exfuse.Socket{}` is the long-lived mount session:
+Build the host app and extension. Xcode owns provisioning and signing:
 
-```elixir
-%Exfuse.Socket{
-  id: term,
-  mount_point: "/tmp/docsfs",
-  state: term,
-  assigns: %{}
-}
+```sh
+mix exfuse.fskit.bundle --team TEAMID
 ```
 
-Useful handle helpers:
+The team may instead come from `DEVELOPMENT_TEAM`. For compile/package checks:
 
-```elixir
-{handle, socket} = Exfuse.Socket.new_handle(socket, value)
-{:ok, value} = Exfuse.Socket.fetch_handle(socket, handle)
-socket = Exfuse.Socket.delete_handle(socket, handle)
+```sh
+mix exfuse.fskit.bundle --no-sign
 ```
 
-The event carrier is a map. Every event includes:
+Build, sign, install, register, and elect the extension:
 
-```elixir
-%{
-  path: "/file",
-  uid: uid,
-  gid: gid,
-  pid: pid,
-  umask: umask
-}
+```sh
+mix exfuse.fskit.install --build --team TEAMID
 ```
 
-Extra fields by operation:
+macOS also requires enabling `exfuse` under:
 
-| op | fields |
-| --- | --- |
-| `:read` | `flags`, `handle`, `offset`, `size` |
-| `:write` | `handle`, `offset`, `data` |
-| `:open` | `flags` |
-| `:create` | `mode`, `flags` |
-| `:truncate` | `size` |
-| `:rename` | `target` |
-| `:mkdir`, `:chmod` | `mode` |
-| `:chown` | `owner_uid`, `owner_gid` |
-| `:flush`, `:release` | `flags`, `handle` |
-| `:fsync` | `datasync`, `flags`, `handle` |
+```text
+System Settings > General > Login Items & Extensions > File System Extensions
+```
 
-`handle_event/3` receives the operation as the first argument, so route and
-manual code usually match on `op` there rather than inside the event map.
+## Build and test
+
+Tool versions live in `.mise.toml`: Elixir 1.20.1 on OTP 29.
+
+```sh
+mise install
+mise exec -- mix deps.get
+mise exec -- mix compile
+mise exec -- mix test
+```
+
+On macOS, Mix does not build the Linux FUSE port. Check it independently with:
+
+```sh
+cargo check --manifest-path rust/Cargo.toml
+```
+
+## License
+
+MIT.

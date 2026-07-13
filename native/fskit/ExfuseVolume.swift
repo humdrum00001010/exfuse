@@ -22,6 +22,18 @@ final class ExfuseVolume: FSVolume {
     private var itemsByPath: [String: ExfuseItem] = [:]
     private let itemsLock = NSLock()
 
+    // FSKit may split one directory enumeration across several calls when its
+    // entry packer fills up. Keep the backend result for that enumeration's
+    // verifier so continuation cookies do not issue another full readdir.
+    private struct DirectorySnapshot {
+        let path: String
+        let entries: [ExfuseDirectoryEntry]
+    }
+
+    private var directorySnapshots: [UInt64: DirectorySnapshot] = [:]
+    private var nextDirectoryVerifier: UInt64 = 1
+    private let directorySnapshotsLock = NSLock()
+
     init(port: UInt16, volumeUUID: UUID) {
         client = ExfuseWireClient(port: port)
 
@@ -271,17 +283,48 @@ extension ExfuseVolume: FSVolume.Operations {
             throw posixError(ENOTDIR)
         }
 
-        let entries = try client.readdir(directory.path)
         let start = Int(cookie.rawValue)
+        let snapshot: DirectorySnapshot
+        let currentVerifier: UInt64
 
-        if start > entries.count {
+        if cookie.rawValue == FSDirectoryCookie.initial.rawValue {
+            log.notice("readdir backend \(directory.path, privacy: .public)")
+            let entries = try client.readdir(directory.path)
+
+            (currentVerifier, snapshot) = directorySnapshotsLock.withLock {
+                let currentVerifier = nextDirectoryVerifier
+                nextDirectoryVerifier &+= 1
+                if nextDirectoryVerifier == FSDirectoryVerifier.initial.rawValue {
+                    nextDirectoryVerifier &+= 1
+                }
+
+                let snapshot = DirectorySnapshot(path: directory.path, entries: entries)
+                directorySnapshots[currentVerifier] = snapshot
+                return (currentVerifier, snapshot)
+            }
+        } else {
+            currentVerifier = verifier.rawValue
+
+            guard let existing = directorySnapshotsLock.withLock({
+                directorySnapshots[currentVerifier]
+            }), existing.path == directory.path else {
+                throw posixError(EINVAL)
+            }
+
+            snapshot = existing
+        }
+
+        if start > snapshot.entries.count {
             throw posixError(EINVAL)
         }
 
-        for index in start..<entries.count {
-            let name = entries[index]
+        var complete = true
+
+        for index in start..<snapshot.entries.count {
+            let entry = snapshot.entries[index]
+            let name = entry.name
             let path = directory.path == "/" ? "/" + name : directory.path + "/" + name
-            let attrs = try attributes(for: path)
+            let attrs = attributes(from: entry.attributes, for: path)
             pinRegisteredID(onto: attrs, path: path)
 
             let packed = packer.packEntry(
@@ -293,11 +336,18 @@ extension ExfuseVolume: FSVolume.Operations {
             )
 
             if !packed {
+                complete = false
                 break
             }
         }
 
-        return FSDirectoryVerifier(1)
+        if complete {
+            _ = directorySnapshotsLock.withLock {
+                directorySnapshots.removeValue(forKey: currentVerifier)
+            }
+        }
+
+        return FSDirectoryVerifier(currentVerifier)
     }
 
     // An item's fileID is pinned at first sight and must never change while
@@ -346,6 +396,10 @@ extension ExfuseVolume: FSVolume.Operations {
 
     private func attributes(for path: String) throws -> FSItem.Attributes {
         let attr = try client.getattr(path)
+        return attributes(from: attr, for: path)
+    }
+
+    private func attributes(from attr: ExfuseAttr, for path: String) -> FSItem.Attributes {
         let attrs = FSItem.Attributes()
         attrs.mode = attr.mode
         attrs.type = itemType(for: attr.kind)

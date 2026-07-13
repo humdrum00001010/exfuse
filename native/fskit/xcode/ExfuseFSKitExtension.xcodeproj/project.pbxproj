@@ -1,11 +1,4 @@
 // !$*UTF8*$!
-// Minimal Xcode project for the FSKit appex. The mix task
-// `exfuse.fskit.bundle` builds the extension through this project when full
-// Xcode is available: appexes built by a bare `swiftc` launch, run their
-// @main, and then exit instead of staying resident to serve the extension —
-// the extensionkit-extension product type carries link/packaging behavior
-// the plain toolchain does not reproduce. DEVELOPMENT_TEAM is injected on
-// the xcodebuild command line.
 {
 	archiveVersion = 1;
 	classes = {
@@ -18,12 +11,16 @@
 		AA00000000000000000014 /* ExfuseVolume.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "../ExfuseVolume.swift"; sourceTree = "<group>"; };
 		AA00000000000000000015 /* ExfuseWire.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "../ExfuseWire.swift"; sourceTree = "<group>"; };
 		AA00000000000000000016 /* ExfuseFSKitExtension.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.extensionkit-extension"; includeInIndex = 0; path = ExfuseFSKitExtension.appex; sourceTree = BUILT_PRODUCTS_DIR; };
+		AA00000000000000000017 /* ExfuseFSKitHost.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "../host/ExfuseFSKitHost.swift"; sourceTree = "<group>"; };
+		AA00000000000000000018 /* ExfuseFSKit.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = ExfuseFSKit.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		BB00000000000000000011 /* ExfuseFSKitExtension.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA00000000000000000011; };
 		BB00000000000000000012 /* ExfuseFileSystem.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA00000000000000000012; };
 		BB00000000000000000013 /* ExfuseItem.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA00000000000000000013; };
 		BB00000000000000000014 /* ExfuseVolume.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA00000000000000000014; };
 		BB00000000000000000015 /* ExfuseWire.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA00000000000000000015; };
-		CC00000000000000000011 /* Sources */ = {
+		BB00000000000000000016 /* ExfuseFSKitHost.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA00000000000000000017; };
+		BB00000000000000000017 /* ExfuseFSKitExtension.appex in Embed Extensions */ = {isa = PBXBuildFile; fileRef = AA00000000000000000016; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
+		CC00000000000000000011 /* Extension Sources */ = {
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
@@ -35,6 +32,25 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		CC00000000000000000012 /* Host Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				BB00000000000000000016,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		CC00000000000000000013 /* Embed Extensions */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = "Contents/Extensions";
+			dstSubfolderSpec = 1;
+			files = (
+				BB00000000000000000017,
+			);
+			name = "Embed Extensions";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 		DD00000000000000000011 = {
 			isa = PBXGroup;
 			children = (
@@ -43,6 +59,7 @@
 				AA00000000000000000013,
 				AA00000000000000000014,
 				AA00000000000000000015,
+				AA00000000000000000017,
 				DD00000000000000000012,
 			);
 			sourceTree = "<group>";
@@ -51,11 +68,12 @@
 			isa = PBXGroup;
 			children = (
 				AA00000000000000000016,
+				AA00000000000000000018,
 			);
 			name = Products;
 			sourceTree = "<group>";
 		};
-		EE00000000000000000011 /* target configs */ = {
+		EE00000000000000000011 /* Extension Configurations */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
 				FF00000000000000000012,
@@ -63,7 +81,7 @@
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;
 		};
-		EE00000000000000000012 /* project configs */ = {
+		EE00000000000000000012 /* Project Configurations */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
 				FF00000000000000000011,
@@ -71,14 +89,26 @@
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;
 		};
+		EE00000000000000000013 /* Host Configurations */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				FF00000000000000000013,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
 		FF00000000000000000011 /* Release project */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				DISABLE_MANUAL_TARGET_ORDER_BUILD_WARNING = YES;
+				GCC_TREAT_WARNINGS_AS_ERRORS = YES;
 				SDKROOT = macosx;
+				SWIFT_TREAT_WARNINGS_AS_ERRORS = YES;
 			};
 			name = Release;
 		};
-		FF00000000000000000012 /* Release target */ = {
+		FF00000000000000000012 /* Release extension */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				CODE_SIGN_ENTITLEMENTS = "../Entitlements.plist";
@@ -89,6 +119,23 @@
 				MACOSX_DEPLOYMENT_TARGET = 26.0;
 				PRODUCT_BUNDLE_IDENTIFIER = "org.exfuse.fskit.extension";
 				PRODUCT_NAME = ExfuseFSKitExtension;
+				SWIFT_VERSION = 5.0;
+			};
+			name = Release;
+		};
+		FF00000000000000000013 /* Release host */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_ENTITLEMENTS = "../host/Entitlements.plist";
+				CODE_SIGN_STYLE = Automatic;
+				COPY_PHASE_STRIP = NO;
+				ENABLE_HARDENED_RUNTIME = NO;
+				EXECUTABLE_NAME = ExfuseFSKitHost;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = "../host/Info.plist";
+				MACOSX_DEPLOYMENT_TARGET = 15.4;
+				PRODUCT_BUNDLE_IDENTIFIER = "org.exfuse.fskit";
+				PRODUCT_NAME = ExfuseFSKit;
 				SWIFT_VERSION = 5.0;
 			};
 			name = Release;
@@ -108,12 +155,32 @@
 			productReference = AA00000000000000000016;
 			productType = "com.apple.product-type.extensionkit-extension";
 		};
+		GG00000000000000000012 /* ExfuseFSKitHost */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = EE00000000000000000013;
+			buildPhases = (
+				CC00000000000000000012,
+				CC00000000000000000013,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				JJ00000000000000000011,
+			);
+			name = ExfuseFSKitHost;
+			productName = ExfuseFSKit;
+			productReference = AA00000000000000000018;
+			productType = "com.apple.product-type.application";
+		};
 		HH00000000000000000011 /* Project object */ = {
 			isa = PBXProject;
 			attributes = {
 				LastUpgradeCheck = 1500;
 				TargetAttributes = {
 					GG00000000000000000011 = {
+						CreatedOnToolsVersion = 15.0;
+					};
+					GG00000000000000000012 = {
 						CreatedOnToolsVersion = 15.0;
 					};
 				};
@@ -132,7 +199,20 @@
 			projectRoot = "";
 			targets = (
 				GG00000000000000000011,
+				GG00000000000000000012,
 			);
+		};
+		II00000000000000000011 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = HH00000000000000000011;
+			proxyType = 1;
+			remoteGlobalIDString = GG00000000000000000011;
+			remoteInfo = ExfuseFSKitExtension;
+		};
+		JJ00000000000000000011 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = GG00000000000000000011;
+			targetProxy = II00000000000000000011;
 		};
 	};
 	rootObject = HH00000000000000000011;

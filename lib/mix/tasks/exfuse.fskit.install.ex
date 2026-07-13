@@ -1,8 +1,6 @@
 defmodule Mix.Tasks.Exfuse.Fskit.Install do
   use Mix.Task
 
-  alias Exfuse.FSKit.Signing
-
   @shortdoc "Installs and registers the local macOS FSKit host app"
 
   @moduledoc """
@@ -16,15 +14,12 @@ defmodule Mix.Tasks.Exfuse.Fskit.Install do
 
   The default source path is `_build/fskit/ExfuseFSKit.app`.
 
-  Pass `--build` to build/sign the bundle before installing:
+  Pass `--build` to build and sign the bundle through Xcode before installing:
 
-      mix exfuse.fskit.install --build --sign "Apple Development: Name (TEAMID)"
+      mix exfuse.fskit.install --build --team TEAMID
 
-  If `--sign` is omitted, the build step uses `EXFUSE_CODESIGN_IDENTITY` or
-  auto-selects an Apple Development, Mac Developer, or Developer ID Application
-  identity from the login keychain. Ad-hoc bundles are rejected by default
-  because macOS will not launch an FSKit extension with the restricted FSKit
-  entitlement under an ad-hoc signature.
+  The team can also be set with `DEVELOPMENT_TEAM`. Xcode selects the signing
+  identity and provisioning profile from the configured developer account.
   """
 
   @extension_id "org.exfuse.fskit.extension"
@@ -33,25 +28,25 @@ defmodule Mix.Tasks.Exfuse.Fskit.Install do
   @impl true
   def run(args) do
     if :os.type() == {:unix, :darwin} do
-      {opts, _rest, _invalid} =
+      {opts, _rest, invalid} =
         OptionParser.parse(args,
           strict: [
             source: :string,
             destination: :string,
             build: :boolean,
-            sign: :string,
-            no_sign: :boolean,
-            allow_adhoc: :boolean
+            team: :string
           ],
           aliases: [s: :source, d: :destination]
         )
+
+      if invalid != [], do: Mix.raise("invalid options: #{inspect(invalid)}")
 
       root = File.cwd!()
       source = Path.expand(Keyword.get(opts, :source, "_build/fskit/ExfuseFSKit.app"), root)
       destination = Keyword.get(opts, :destination, "/Applications/ExfuseFSKit.app")
 
       if Keyword.get(opts, :build, false), do: build(source, opts)
-      install(source, destination, opts)
+      install(source, destination)
     else
       Mix.raise("FSKit install can only run on macOS")
     end
@@ -60,15 +55,13 @@ defmodule Mix.Tasks.Exfuse.Fskit.Install do
   defp build(source, opts) do
     args =
       ["--output", source]
-      |> maybe_put_option("--sign", Keyword.get(opts, :sign))
-      |> maybe_put_flag("--no-sign", Keyword.get(opts, :no_sign, false))
-      |> maybe_put_flag("--allow-adhoc", Keyword.get(opts, :allow_adhoc, false))
+      |> maybe_put_option("--team", Keyword.get(opts, :team))
 
     Mix.Task.reenable("exfuse.fskit.bundle")
     Mix.Task.run("exfuse.fskit.bundle", args)
   end
 
-  defp install(source, destination, opts) do
+  defp install(source, destination) do
     unless File.dir?(source) do
       Mix.raise("FSKit bundle not found at #{source}; run mix exfuse.fskit.bundle first")
     end
@@ -76,7 +69,8 @@ defmodule Mix.Tasks.Exfuse.Fskit.Install do
     source_extension = Path.join(source, @extension_relative_path)
     destination_extension = Path.join(destination, @extension_relative_path)
 
-    verify_extension_signature!(source_extension, opts)
+    verify_signature!(source)
+    verify_extension_profile!(source_extension)
 
     maybe_run("pluginkit", ["-r", source_extension])
     maybe_run("pluginkit", ["-r", destination_extension])
@@ -101,54 +95,33 @@ defmodule Mix.Tasks.Exfuse.Fskit.Install do
     )
   end
 
-  defp verify_extension_signature!(source_extension, opts) do
-    if Keyword.get(opts, :allow_adhoc, false) do
-      :ok
-    else
-      do_verify_extension_signature!(source_extension)
-      verify_extension_profile!(source_extension)
-    end
-  end
-
   defp verify_extension_profile!(source_extension) do
     profile = Path.join(source_extension, "Contents/embedded.provisionprofile")
 
     unless File.exists?(profile) do
       Mix.raise("""
       FSKit extension has no embedded.provisionprofile; AMFI will kill it at launch
-      because the FSKit entitlement is restricted. Rebuild with --build (the bundle
-      task embeds a matching profile) after minting one with mix exfuse.fskit.provision.
+      because the FSKit entitlement is restricted. Rebuild with --build --team TEAMID.
       """)
     end
 
     :ok
   end
 
-  defp do_verify_extension_signature!(source_extension) do
-    case Signing.signature(source_extension) do
-      {:ok, :signed} ->
+  defp verify_signature!(source) do
+    case System.cmd("codesign", ["--verify", "--deep", "--strict", source],
+           stderr_to_stdout: true
+         ) do
+      {_output, 0} ->
         :ok
 
-      {:ok, :adhoc} ->
-        Mix.raise("""
-        FSKit extension is ad-hoc signed and macOS will reject its restricted entitlement.
-        Rebuild with --build --sign "Apple Development: Name (TEAMID)" or set
-        EXFUSE_CODESIGN_IDENTITY. Pass --allow-adhoc only for non-runnable local checks.
-        """)
-
-      {:error, {status, output}} ->
+      {output, status} ->
         Mix.raise("codesign verification failed with status #{status}\n#{output}")
-
-      {:error, reason} ->
-        Mix.raise("codesign verification failed: #{inspect(reason)}")
     end
   end
 
   defp maybe_put_option(args, _name, nil), do: args
   defp maybe_put_option(args, name, value), do: args ++ [name, value]
-
-  defp maybe_put_flag(args, name, true), do: args ++ [name]
-  defp maybe_put_flag(args, _name, false), do: args
 
   defp run!(command, args) do
     case System.cmd(command, args, stderr_to_stdout: true) do

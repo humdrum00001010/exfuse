@@ -12,19 +12,23 @@ defmodule Exfuse.Fs.Hello do
   end
 
   readdir "/" do
-    {:reply, ["hello", "world"], socket}
+    {:reply,
+     [
+       {"hello", attr(type: :file, size: byte_size(@hello))},
+       {"world", attr(type: :symlink, size: byte_size("hello"))}
+     ], socket}
   end
 
   getattr "/" do
-    {:reply, dir(), socket}
+    {:reply, attr(type: :dir), socket}
   end
 
   getattr "/hello" do
-    {:reply, file(size: byte_size(@hello)), socket}
+    {:reply, attr(type: :file, size: byte_size(@hello)), socket}
   end
 
   getattr "/world" do
-    {:reply, symlink(length: byte_size("hello")), socket}
+    {:reply, attr(type: :symlink, size: byte_size("hello")), socket}
   end
 
   readlink "/world" do

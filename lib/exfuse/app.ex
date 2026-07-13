@@ -7,8 +7,10 @@ defmodule Exfuse.App do
 
   def start(_type, _args) do
     children = [
-      Exfuse.MountSup,
-      {Task, fn -> Exfuse.FSKit.LegacyResourceCleanup.cleanup() end}
+      Exfuse.FsSupervisor,
+      Exfuse.FileSupervisor,
+      Exfuse.MountSupervisor,
+      {Task.Supervisor, name: Exfuse.RequestSupervisor}
     ]
 
     opts = [strategy: :one_for_one, name: Exfuse.Sup]

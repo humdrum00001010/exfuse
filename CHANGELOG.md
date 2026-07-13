@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Let Xcode own FSKit host and extension provisioning and signing.
+- Remove runtime signing/profile modules and the generated provisioning project.
 - Fix FSKit item identity across rename-over-existing: `getattr`/`setattr`/`readdir` now report the pinned item ID instead of recomputing it from the current path, so a temp file renamed over an existing name keeps one consistent object identity.
 - Add wire client socket timeouts so a backend that accepts but never replies (protocol skew, wedged listener) fails bounded with ETIMEDOUT instead of blocking extension threads forever.
 - Reuse a fixed pool of wire connections per volume instead of dialing one ephemeral localhost connection per filesystem callback.

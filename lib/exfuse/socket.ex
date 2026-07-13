@@ -4,23 +4,23 @@ defmodule Exfuse.Socket do
   """
 
   defstruct id: nil,
-            mount_point: nil,
+            runtime: nil,
             state: nil,
             assigns: %{}
 
   @type handle :: non_neg_integer
   @type t :: %__MODULE__{
           id: term,
-          mount_point: String.t(),
+          runtime: term,
           state: term,
           assigns: map
         }
 
-  @spec new(String.t(), term) :: t
-  def new(mount_point, state) do
+  @spec new(term, term) :: t
+  def new(runtime, state) do
     %__MODULE__{
       id: {self(), System.unique_integer([:positive, :monotonic])},
-      mount_point: mount_point,
+      runtime: runtime,
       state: state
     }
   end
