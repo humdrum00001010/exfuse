@@ -149,14 +149,25 @@ defmodule Exfuse.File do
     %{state | active: Map.put(state.active, task.ref, request), writer: writer}
   end
 
-  defp complete_request(state, %{kind: :read, base_socket: base, from: from}, result) do
-    if result_socket(result) == base do
-      GenServer.reply(from, result)
-    else
-      GenServer.reply(from, {:error, :eio, state.socket})
-    end
+  defp complete_request(state, %{kind: :read, base_socket: base, from: from} = request, result) do
+    socket = result_socket(result)
 
-    state
+    cond do
+      socket == base ->
+        GenServer.reply(from, result)
+        state
+
+      state.socket == base ->
+        GenServer.reply(from, result)
+        %{state | socket: socket}
+
+      socket == state.socket ->
+        GenServer.reply(from, result)
+        state
+
+      true ->
+        retry_as_writer(state, request)
+    end
   end
 
   defp complete_request(state, %{kind: :write, from: from}, result) do
@@ -197,6 +208,16 @@ defmodule Exfuse.File do
 
   defp clear_writer(reference, reference), do: nil
   defp clear_writer(writer, _reference), do: writer
+
+  defp retry_as_writer(state, request) do
+    request = request |> Map.drop([:base_socket, :pid]) |> Map.put(:kind, :write)
+
+    %{
+      state
+      | queue: :queue.in_r(request, state.queue),
+        queue_size: state.queue_size + 1
+    }
+  end
 
   defp positive_option(options, key, default) do
     case Keyword.get(options, key, default) do

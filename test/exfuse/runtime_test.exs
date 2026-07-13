@@ -23,6 +23,20 @@ defmodule Exfuse.RuntimeTest do
       end
     end
 
+    def handle_event(:getattr, %{token: token}, socket) do
+      send(socket.state.owner, {:getattr_started, token, socket.state.writes, self()})
+
+      receive do
+        {:release, ^token} ->
+          increment = if token == :a, do: 1, else: 2
+
+          next =
+            Socket.put_state(socket, %{socket.state | writes: socket.state.writes + increment})
+
+          {:reply, Exfuse.Fs.attr(type: :dir), next}
+      end
+    end
+
     def handle_event(_operation, _event, socket), do: {:error, :enoent, socket}
   end
 
@@ -71,6 +85,25 @@ defmodule Exfuse.RuntimeTest do
     assert_receive {:write_started, :b, 1, b}
     send(b, {:release, :b})
     assert {:reply, 1, _} = Task.await(second)
+  end
+
+  test "conflicting stateful reads retry in order instead of returning EIO", %{root_file: file} do
+    first = Task.async(fn -> File.dispatch(file, :getattr, %{token: :a, path: "/"}) end)
+    second = Task.async(fn -> File.dispatch(file, :getattr, %{token: :b, path: "/"}) end)
+
+    assert_receive {:getattr_started, :a, 0, a}
+    assert_receive {:getattr_started, :b, 0, b}
+
+    send(a, {:release, :a})
+    assert {:reply, _attr, _} = Task.await(first)
+
+    send(b, {:release, :b})
+    assert_receive {:getattr_started, :b, 1, retried_b}
+    send(retried_b, {:release, :b})
+
+    assert {:reply, _attr, socket} = Task.await(second)
+    assert socket.state.writes == 3
+    assert File.snapshot(file).state.writes == 3
   end
 
   test "a mount point has one owner and unmount is idempotent", %{fs: fs} do
