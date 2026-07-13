@@ -2,7 +2,7 @@ import Darwin
 import Foundation
 
 private let exfuseMagic: UInt32 = 0xC021_55AC
-private let exfuseProtocolV2: UInt32 = 0x7632_0002
+private let exfuseProtocolV3: UInt32 = 0x7633_0003
 
 enum ExfuseRequest: UInt32 {
     case readdir = 3
@@ -40,6 +40,11 @@ struct ExfuseAttr {
     let mtime: UInt64?
 }
 
+struct ExfuseDirectoryEntry {
+    let name: String
+    let attributes: ExfuseAttr
+}
+
 private final class ExfuseWireConnection {
     let lock = NSLock()
     var descriptor: Int32 = -1
@@ -63,8 +68,9 @@ final class ExfuseWireClient {
     private static let connectionPoolSize = 16
     private let idLock = NSLock()
     private var nextRequestID: UInt64 = 1
-    private var nextConnection = 0
     private let connections = (0..<connectionPoolSize).map { _ in ExfuseWireConnection() }
+    private let poolCondition = NSCondition()
+    private lazy var availableConnections = connections
     private let port: UInt16
 
     init(port: UInt16) {
@@ -73,14 +79,45 @@ final class ExfuseWireClient {
 
     func getattr(_ path: String) throws -> ExfuseAttr {
         let response = try request(.getattr, payload: Data(path.utf8))
-        guard response.count == 12 || response.count == 20 else {
+        return try decodeAttr(response)
+    }
+
+    func readdir(_ path: String) throws -> [ExfuseDirectoryEntry] {
+        let response = try request(.readdir, payload: Data(path.utf8))
+        guard response.count >= 4 else { throw posixError(EIO) }
+
+        let count = Int(response.readUInt32(at: 0))
+        var offset = 4
+        var entries: [ExfuseDirectoryEntry] = []
+        entries.reserveCapacity(count)
+
+        for _ in 0..<count {
+            let nameData = try takeLengthPrefixed(response, offset: &offset)
+            let attrData = try takeLengthPrefixed(response, offset: &offset)
+
+            guard let name = String(data: nameData, encoding: .utf8),
+                  !name.isEmpty, name != ".", name != "..",
+                  !name.contains("/"), !name.utf8.contains(0)
+            else {
+                throw posixError(EIO)
+            }
+
+            entries.append(ExfuseDirectoryEntry(name: name, attributes: try decodeAttr(attrData)))
+        }
+
+        guard offset == response.count else { throw posixError(EIO) }
+        return entries
+    }
+
+    private func decodeAttr(_ response: Data) throws -> ExfuseAttr {
+        guard response.count == 16 || response.count == 24 else {
             throw posixError(EIO)
         }
 
         let mode = response.readUInt32(at: 0)
         let kindValue = response.readUInt32(at: 4)
-        let size = UInt64(response.readUInt32(at: 8))
-        let mtime = response.count == 20 ? response.readUInt64(at: 12) : nil
+        let size = response.readUInt64(at: 8)
+        let mtime = response.count == 24 ? response.readUInt64(at: 16) : nil
 
         guard let kind = ExfuseNodeKind(rawValue: kindValue) else {
             throw posixError(EIO)
@@ -89,12 +126,13 @@ final class ExfuseWireClient {
         return ExfuseAttr(mode: mode, kind: kind, size: size, mtime: mtime)
     }
 
-    func readdir(_ path: String) throws -> [String] {
-        let response = try request(.readdir, payload: Data(path.utf8))
-
-        return response.split(separator: 0)
-            .filter { !$0.isEmpty }
-            .map { String(decoding: $0, as: UTF8.self) }
+    private func takeLengthPrefixed(_ data: Data, offset: inout Int) throws -> Data {
+        guard offset + 4 <= data.count else { throw posixError(EIO) }
+        let length = Int(data.readUInt32(at: offset))
+        offset += 4
+        guard length >= 0, offset + length <= data.count else { throw posixError(EIO) }
+        defer { offset += length }
+        return data.subdata(in: offset..<(offset + length))
     }
 
     func readlink(_ path: String) throws -> String {
@@ -238,11 +276,13 @@ final class ExfuseWireClient {
     }
 
     private func request(_ request: ExfuseRequest, payload: Data) throws -> Data {
-        let (requestID, connection) = allocateRequest()
+        let requestID = allocateRequestID()
+        let connection = checkoutConnection()
+        defer { checkinConnection(connection) }
 
         var frame = Data()
         frame.appendUInt32(exfuseMagic)
-        frame.appendUInt32(exfuseProtocolV2)
+        frame.appendUInt32(exfuseProtocolV3)
         frame.appendUInt32(request.rawValue)
         frame.appendUInt64(requestID)
         frame.appendUInt32(UInt32(getuid()))
@@ -271,7 +311,7 @@ final class ExfuseWireClient {
 
         guard response.count >= 24,
               response.readUInt32(at: 0) == exfuseMagic,
-              response.readUInt32(at: 4) == exfuseProtocolV2,
+              response.readUInt32(at: 4) == exfuseProtocolV3,
               response.readUInt32(at: 8) == request.rawValue,
               response.readUInt64(at: 12) == requestID
         else {
@@ -287,15 +327,27 @@ final class ExfuseWireClient {
         return response.subdata(in: 24..<response.count)
     }
 
-    private func allocateRequest() -> (UInt64, ExfuseWireConnection) {
+    private func allocateRequestID() -> UInt64 {
         idLock.lock()
         defer { idLock.unlock() }
 
         let requestID = nextRequestID
         nextRequestID &+= 1
-        let connection = connections[nextConnection]
-        nextConnection = (nextConnection + 1) % connections.count
-        return (requestID, connection)
+        return requestID
+    }
+
+    private func checkoutConnection() -> ExfuseWireConnection {
+        poolCondition.lock()
+        defer { poolCondition.unlock() }
+        while availableConnections.isEmpty { poolCondition.wait() }
+        return availableConnections.removeLast()
+    }
+
+    private func checkinConnection(_ connection: ExfuseWireConnection) {
+        poolCondition.lock()
+        availableConnections.append(connection)
+        poolCondition.signal()
+        poolCondition.unlock()
     }
 
     // A backend that accepts the connection but never replies (protocol-skewed

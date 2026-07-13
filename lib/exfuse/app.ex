@@ -7,13 +7,11 @@ defmodule Exfuse.App do
 
   def start(_type, _args) do
     children = [
-      # Per-mount-point server identity: `Exfuse.Server` registers under its
-      # mount point, so a second mount of the same point fails fast instead of
-      # racing a duplicate server onto one kernel mount. Started first so a
-      # server can never come up without the exclusivity guarantee.
-      {Registry, keys: :unique, name: Exfuse.Registry},
-      Exfuse.MountSup,
-      {Task, fn -> Exfuse.FSKit.LegacyResourceCleanup.cleanup() end}
+      {Registry, keys: :unique, name: Exfuse.MountRegistry},
+      Exfuse.FsSupervisor,
+      Exfuse.FileSupervisor,
+      Exfuse.MountSupervisor,
+      {Task.Supervisor, name: Exfuse.RequestSupervisor}
     ]
 
     opts = [strategy: :one_for_one, name: Exfuse.Sup]

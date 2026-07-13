@@ -70,9 +70,16 @@ defmodule Exfuse.Fs.Dsl do
     end
   end
 
-  def dir(opts \\ []), do: attr(:dir, opts)
-  def file(opts \\ []), do: attr(:file, opts)
-  def symlink(opts \\ []), do: attr(:symlink, opts)
+  def attr(opts) when is_list(opts) do
+    type = Keyword.fetch!(opts, :type)
+    mode = Keyword.get(opts, :mode, default_mode(type))
+    size = Keyword.get(opts, :size, 0)
+
+    case Keyword.get(opts, :mtime) do
+      nil -> {mode, attr_type(type), size}
+      mtime when is_integer(mtime) -> {mode, attr_type(type), size, mtime}
+    end
+  end
 
   def put_state(%Exfuse.Socket{} = socket, state), do: Exfuse.Socket.put_state(socket, state)
 
@@ -122,7 +129,10 @@ defmodule Exfuse.Fs.Dsl do
   def errno(:enoent), do: @error_noent
   def errno(:eperm), do: 1
   def errno(:eio), do: 5
+  def errno(:e2big), do: 7
+  def errno(:eagain), do: 11
   def errno(:eacces), do: 13
+  def errno(:ebusy), do: 16
   def errno(:eexist), do: 17
   def errno(:enotdir), do: 20
   def errno(:eisdir), do: 21
@@ -225,26 +235,25 @@ defmodule Exfuse.Fs.Dsl do
   defp compile_init(_env, nil, false), do: nil
 
   defp compile_init(env, nil, true) do
-    if Module.defines?(env.module, {:exfuse_init, 2}, :def) do
+    if Module.defines?(env.module, {:exfuse_init, 1}, :def) do
       nil
     else
       quote do
-        def exfuse_init(_mount_point, opts), do: {:ok, opts}
+        def exfuse_init(init_arg), do: {:ok, init_arg}
       end
     end
   end
 
   defp compile_init(env, {block, line}, _has_routes?) do
-    if Module.defines?(env.module, {:exfuse_init, 2}, :def) do
+    if Module.defines?(env.module, {:exfuse_init, 1}, :def) do
       raise CompileError,
         file: env.file,
         line: line,
-        description: "init macro cannot be used with exfuse_init/2"
+        description: "init macro cannot be used with exfuse_init/1"
     end
 
     quote do
-      def exfuse_init(var!(mount_point), var!(opts)) do
-        _ = var!(mount_point)
+      def exfuse_init(var!(opts)) do
         _ = var!(opts)
         Exfuse.Fs.Dsl.normalize_init_result(unquote(block))
       end
@@ -330,18 +339,19 @@ defmodule Exfuse.Fs.Dsl do
   defp compile_plug_clause(dispatch, op, route, module) do
     pattern = route_pattern(route)
     params = route_params(route)
-    endpoint = Macro.escape({module, route})
+    declaration = Macro.escape({module, route})
 
     quote do
       defp unquote(dispatch)(unquote(pattern), event, socket) do
         params = unquote(params)
         event = Exfuse.Fs.Dsl.put_params(event, params)
-        endpoint = {unquote(endpoint), params}
 
-        Exfuse.Fs.Dsl.normalize_event_result(
+        Exfuse.Fs.Runtime.dispatch_plug(
+          socket,
+          unquote(declaration),
+          unquote(module),
           unquote(op),
-          Exfuse.Endpoint.dispatch(endpoint, unquote(module), unquote(op), event, socket),
-          socket
+          event
         )
       end
     end
@@ -393,33 +403,16 @@ defmodule Exfuse.Fs.Dsl do
 
   defp dispatch_name(op), do: :"__exfuse_#{op}__"
 
-  # `mtime:` is optional; when given, the reply becomes a 4-tuple and travels
-  # as the extended 20-byte wire attr. Content-projection filesystems use it
-  # to signal content changes so kernels that cache data (FSKit) revalidate.
-  defp attr(type, opts) do
-    mode = Keyword.get(opts, :mode, default_mode(type))
-    size = Keyword.get(opts, :size, attr_size(type, opts))
-
-    case Keyword.get(opts, :mtime) do
-      nil -> {mode, attr_type(type), size}
-      mtime when is_integer(mtime) -> {mode, attr_type(type), size, mtime}
-    end
-  end
-
-  defp attr_size(:symlink, opts) do
-    case Keyword.get(opts, :to) do
-      nil -> Keyword.get(opts, :length, 0)
-      dest -> byte_size(dest)
-    end
-  end
-
-  defp attr_size(_type, _opts), do: 0
-
   defp default_mode(:dir), do: 0o0755
   defp default_mode(:file), do: 0o0644
   defp default_mode(:symlink), do: 0o0755
 
   defp normalize_route_value(:getattr, value), do: normalize_attr(value)
+
+  defp normalize_route_value(:readdir, entries) when is_list(entries) do
+    Enum.map(entries, fn {name, attributes} -> {name, normalize_attr(attributes)} end)
+  end
+
   defp normalize_route_value(_op, value), do: value
 
   defp normalize_attr(%{} = attrs) do

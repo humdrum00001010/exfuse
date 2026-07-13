@@ -1,31 +1,34 @@
 defmodule Exfuse.Fs do
   @moduledoc """
-  Filesystems implement FUSE operations with route macros or `handle_event/3`.
-  `Exfuse.mount/3` mounts one filesystem process; routes define the directory
-  tree below that mount point.
+  Filesystems implement native filesystem operations with route macros or
+  `handle_event/3`. Start the logical filesystem once with `Exfuse.start_fs/3`,
+  then attach any number of native mount points with `Exfuse.mount/3`.
 
       init do
         opts
       end
 
       readdir "/" do
-        {:reply, ["docs"], socket}
+        {:reply, [{"docs", attr(type: :dir)}], socket}
       end
 
       getattr "/" do
-        {:reply, dir(), socket}
+        {:reply, attr(type: :dir), socket}
       end
 
       readdir "/docs" do
-        {:reply, Map.keys(state), socket}
+        entries = Enum.map(state, fn {name, body} ->
+          {name, attr(type: :file, size: byte_size(body))}
+        end)
+        {:reply, entries, socket}
       end
 
       getattr "/docs" do
-        {:reply, dir(), socket}
+        {:reply, attr(type: :dir), socket}
       end
 
       getattr "/docs/:name" do
-        {:reply, file(size: byte_size(state[name])), socket}
+        {:reply, attr(type: :file, size: byte_size(state[name])), socket}
       end
 
       read "/docs/:name" do
@@ -37,13 +40,13 @@ defmodule Exfuse.Fs do
   `:name` binds one path segment as a binary. `*name` binds the remaining path
   tail as a list of segments, and bare `*` matches the remaining tail without
   binding it. Route blocks can read `event`, `socket` and `state`; params are
-  endpoint variables, not fields on the socket. `init` blocks can read
-  `mount_point` and `opts`.
+  endpoint variables, not fields on the socket. `init` blocks can read `opts`,
+  the init argument passed to `Exfuse.start_fs/3`.
 
   Or implement `handle_event/3` and pattern match on the event payload:
 
       def handle_event(:getattr, %{path: "/"}, socket) do
-        {:reply, dir(), socket}
+        {:reply, attr(type: :dir), socket}
       end
 
       def handle_event(:read, %{path: "/docs/" <> _} = event, socket) do
@@ -66,13 +69,14 @@ defmodule Exfuse.Fs do
     * `:flush` and `:release` - `flags`, `handle`
     * `:fsync` - `datasync`, `flags`, `handle`
 
-  `plug/2` delegates every operation matching the path to an endpoint process.
-  Endpoint processes are keyed by route params. A plugged module can define
-  `init/1`; after that it receives packets through `handle_event/3`.
+  `plug/2` delegates every operation matching the path to one persistent
+  `Exfuse.File` process for that declaration. Route values do not create more
+  processes. A plugged module can define `exfuse_init/1`; after that it receives
+  events through `handle_event/3`.
 
       defmodule MyApp.MediaFile do
-        def init(socket) do
-          {:ok, socket}
+        def exfuse_init(opts) do
+          {:ok, opts}
         end
 
         def handle_event(:read, %{params: %{file: file}} = event, socket) do
@@ -90,20 +94,8 @@ defmodule Exfuse.Fs do
     end
   end
 
-  @doc """
-  Builds a directory attribute reply for `getattr`.
-  """
-  defdelegate dir(opts \\ []), to: Exfuse.Fs.Dsl
-
-  @doc """
-  Builds a regular file attribute reply for `getattr`.
-  """
-  defdelegate file(opts \\ []), to: Exfuse.Fs.Dsl
-
-  @doc """
-  Builds a symlink attribute reply for `getattr`.
-  """
-  defdelegate symlink(opts \\ []), to: Exfuse.Fs.Dsl
+  @doc "Builds an attribute reply for `getattr` or `readdir`."
+  defdelegate attr(opts), to: Exfuse.Fs.Dsl
 
   @type operation ::
           :readdir
@@ -147,7 +139,7 @@ defmodule Exfuse.Fs do
           | {:reply, term, Exfuse.Socket.t()}
           | {:error, term, Exfuse.Socket.t()}
 
-  @callback exfuse_init(String.t(), term) :: {:ok, term} | {:error, term}
+  @callback exfuse_init(term) :: {:ok, term} | {:error, term}
 
   @callback handle_event(operation, event, Exfuse.Socket.t()) :: event_result
 
@@ -175,13 +167,9 @@ defmodule Exfuse.Fs do
           release: 2,
           fsync: 2,
           plug: 2,
-          dir: 0,
-          dir: 1,
-          file: 0,
-          file: 1,
+          attr: 1,
           put_state: 2,
-          symlink: 0,
-          symlink: 1
+          split_path: 1
         ]
 
       Module.register_attribute(__MODULE__, :exfuse_routes, accumulate: true)

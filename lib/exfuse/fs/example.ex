@@ -29,19 +29,26 @@ defmodule Exfuse.Fs.Example do
   end
 
   readdir "/*" do
-    reply(Map.fetch(@dirs, event.path), socket)
+    case Map.fetch(@dirs, event.path) do
+      {:ok, names} ->
+        entries = Enum.map(names, fn name -> {name, attributes(child(event.path, name))} end)
+        {:reply, entries, socket}
+
+      :error ->
+        {:error, :enoent, socket}
+    end
   end
 
   getattr "/*" do
     cond do
       Map.has_key?(@dirs, event.path) ->
-        {:reply, dir(), socket}
+        {:reply, attr(type: :dir), socket}
 
       content = @files[event.path] ->
-        {:reply, file(size: byte_size(content)), socket}
+        {:reply, attr(type: :file, size: byte_size(content)), socket}
 
       target = @links[event.path] ->
-        {:reply, symlink(length: byte_size(target)), socket}
+        {:reply, attr(type: :symlink, size: byte_size(target)), socket}
 
       true ->
         {:error, :enoent, socket}
@@ -67,5 +74,16 @@ defmodule Exfuse.Fs.Example do
     start = min(offset, byte_size(content))
     count = min(size, byte_size(content) - start)
     binary_part(content, start, count)
+  end
+
+  defp child("/", name), do: "/" <> name
+  defp child(parent, name), do: parent <> "/" <> name
+
+  defp attributes(path) do
+    cond do
+      Map.has_key?(@dirs, path) -> Exfuse.Fs.attr(type: :dir)
+      content = @files[path] -> Exfuse.Fs.attr(type: :file, size: byte_size(content))
+      target = @links[path] -> Exfuse.Fs.attr(type: :symlink, size: byte_size(target))
+    end
   end
 end
