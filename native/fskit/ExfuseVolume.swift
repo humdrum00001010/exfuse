@@ -249,8 +249,11 @@ extension ExfuseVolume: FSVolume.Operations {
 
         itemsLock.withLock {
             itemsByPath.removeValue(forKey: source)
-            itemsByPath.removeValue(forKey: destination)
+            let cachedDestination = itemsByPath.removeValue(forKey: destination)
 
+            if let overwritten = cachedDestination, overwritten !== item {
+                overwritten.deleted = true
+            }
             if let overwritten = overItem as? ExfuseItem, overwritten !== item {
                 overwritten.deleted = true
             }
