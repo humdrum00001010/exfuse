@@ -99,9 +99,7 @@ extension ExfuseVolume: FSVolume.Operations {
         _ desiredAttributes: FSItem.GetAttributesRequest,
         of item: FSItem
     ) async throws -> FSItem.Attributes {
-        guard let item = item as? ExfuseItem else {
-            throw posixError(EIO)
-        }
+        let item = try liveItem(item)
 
         return try attributes(of: item)
     }
@@ -110,9 +108,7 @@ extension ExfuseVolume: FSVolume.Operations {
         _ newAttributes: FSItem.SetAttributesRequest,
         on item: FSItem
     ) async throws -> FSItem.Attributes {
-        guard let item = item as? ExfuseItem else {
-            throw posixError(EIO)
-        }
+        let item = try liveItem(item)
 
         if newAttributes.isValid(.size) {
             try client.truncate(path: item.path, size: newAttributes.size)
@@ -146,9 +142,7 @@ extension ExfuseVolume: FSVolume.Operations {
         named name: FSFileName,
         inDirectory directory: FSItem
     ) async throws -> (FSItem, FSFileName) {
-        guard let directory = directory as? ExfuseItem else {
-            throw posixError(ENOTDIR)
-        }
+        let directory = try liveItem(directory, invalidError: ENOTDIR)
 
         let path = try childPath(directory: directory, name: name)
         log.notice("lookup \(path, privacy: .public)")
@@ -168,9 +162,7 @@ extension ExfuseVolume: FSVolume.Operations {
     }
 
     func readSymbolicLink(_ item: FSItem) async throws -> FSFileName {
-        guard let item = item as? ExfuseItem else {
-            throw posixError(EIO)
-        }
+        let item = try liveItem(item)
 
         return FSFileName(string: try client.readlink(item.path))
     }
@@ -222,9 +214,7 @@ extension ExfuseVolume: FSVolume.Operations {
         named name: FSFileName,
         fromDirectory directory: FSItem
     ) async throws {
-        guard let item = item as? ExfuseItem else {
-            throw posixError(EIO)
-        }
+        let item = try liveItem(item)
 
         if item.attributes.type == .directory {
             try client.rmdir(item.path)
@@ -236,6 +226,7 @@ extension ExfuseVolume: FSVolume.Operations {
             if itemsByPath[item.path] === item {
                 itemsByPath.removeValue(forKey: item.path)
             }
+            item.deleted = true
         }
     }
 
@@ -247,26 +238,26 @@ extension ExfuseVolume: FSVolume.Operations {
         inDirectory destinationDirectory: FSItem,
         overItem: FSItem?
     ) async throws -> FSFileName {
-        guard
-            let sourceDirectory = sourceDirectory as? ExfuseItem,
-            let destinationDirectory = destinationDirectory as? ExfuseItem
-        else {
-            throw posixError(EIO)
-        }
+        let item = try liveItem(item)
+        let sourceDirectory = try liveItem(sourceDirectory)
+        let destinationDirectory = try liveItem(destinationDirectory)
 
         let source = try childPath(directory: sourceDirectory, name: sourceName)
         let destination = try childPath(directory: destinationDirectory, name: destinationName)
+        log.notice("rename \(source, privacy: .public) to \(destination, privacy: .public)")
         try client.rename(from: source, to: destination)
 
         itemsLock.withLock {
             itemsByPath.removeValue(forKey: source)
             itemsByPath.removeValue(forKey: destination)
 
-            if let item = item as? ExfuseItem {
-                item.path = destination
-                item.name = fileName(for: destination)
-                itemsByPath[destination] = item
+            if let overwritten = overItem as? ExfuseItem, overwritten !== item {
+                overwritten.deleted = true
             }
+
+            item.path = destination
+            item.name = fileName(for: destination)
+            itemsByPath[destination] = item
         }
 
         return fileName(for: destination)
@@ -356,6 +347,10 @@ extension ExfuseVolume: FSVolume.Operations {
     // fileID of a temp file renamed over an existing name flip between
     // operations, which desyncs the kernel's object identity for that vnode.
     private func attributes(of item: ExfuseItem) throws -> FSItem.Attributes {
+        guard !item.deleted else {
+            throw posixError(ESTALE)
+        }
+
         let attrs = try attributes(for: item.path)
         attrs.fileID = item.id
         return attrs
@@ -378,7 +373,7 @@ extension ExfuseVolume: FSVolume.Operations {
         itemsLock.lock()
         defer { itemsLock.unlock() }
 
-        if let existing = itemsByPath[normalized] {
+        if let existing = itemsByPath[normalized], !existing.deleted {
             attrs.fileID = existing.id
             existing.attributes = attrs
             return existing
@@ -391,6 +386,16 @@ extension ExfuseVolume: FSVolume.Operations {
         )
 
         itemsByPath[normalized] = item
+        return item
+    }
+
+    private func liveItem(_ item: FSItem, invalidError: Int32 = EIO) throws -> ExfuseItem {
+        guard let item = item as? ExfuseItem else {
+            throw posixError(invalidError)
+        }
+        guard !item.deleted else {
+            throw posixError(ESTALE)
+        }
         return item
     }
 
@@ -436,9 +441,7 @@ extension ExfuseVolume: FSVolume.Operations {
 
 extension ExfuseVolume: FSVolume.OpenCloseOperations {
     func openItem(_ item: FSItem, modes: FSVolume.OpenModes) async throws {
-        guard let item = item as? ExfuseItem else {
-            throw posixError(EIO)
-        }
+        let item = try liveItem(item)
 
         log.notice("open \(item.path, privacy: .public)")
         do {
@@ -453,6 +456,9 @@ extension ExfuseVolume: FSVolume.OpenCloseOperations {
         guard let item = item as? ExfuseItem else {
             throw posixError(EIO)
         }
+        if item.deleted {
+            return
+        }
 
         try client.release(path: item.path, flags: UInt32(modes.rawValue))
     }
@@ -465,9 +471,7 @@ extension ExfuseVolume: FSVolume.ReadWriteOperations {
         length: Int,
         into buffer: FSMutableFileDataBuffer
     ) async throws -> Int {
-        guard let item = item as? ExfuseItem else {
-            throw posixError(EIO)
-        }
+        let item = try liveItem(item)
 
         log.notice("read \(item.path, privacy: .public) at \(offset) length \(length)")
         let data: Data
@@ -496,9 +500,7 @@ extension ExfuseVolume: FSVolume.ReadWriteOperations {
     }
 
     func write(contents: Data, to item: FSItem, at offset: off_t) async throws -> Int {
-        guard let item = item as? ExfuseItem else {
-            throw posixError(EIO)
-        }
+        let item = try liveItem(item)
 
         return try client.write(path: item.path, offset: UInt64(max(offset, 0)), data: contents)
     }

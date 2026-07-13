@@ -5,6 +5,7 @@ final class ExfuseItem: FSItem {
     var path: String
     var name: FSFileName
     var attributes: FSItem.Attributes
+    var deleted = false
 
     // Assigned once at first sight and kept for the item's lifetime, even
     // across renames: FSKit correlates FSItem instances with kernel state, so
