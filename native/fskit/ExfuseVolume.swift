@@ -91,7 +91,7 @@ extension ExfuseVolume: FSVolume.Operations {
             throw posixError(EIO)
         }
 
-        return try attributes(for: item.path)
+        return try attributes(of: item)
     }
 
     func setAttributes(
@@ -127,7 +127,7 @@ extension ExfuseVolume: FSVolume.Operations {
             }
         }
 
-        return try attributes(for: item.path)
+        return try attributes(of: item)
     }
 
     func lookupItem(
@@ -282,6 +282,7 @@ extension ExfuseVolume: FSVolume.Operations {
             let name = entries[index]
             let path = directory.path == "/" ? "/" + name : directory.path + "/" + name
             let attrs = try attributes(for: path)
+            pinRegisteredID(onto: attrs, path: path)
 
             let packed = packer.packEntry(
                 name: FSFileName(string: name),
@@ -297,6 +298,27 @@ extension ExfuseVolume: FSVolume.Operations {
         }
 
         return FSDirectoryVerifier(1)
+    }
+
+    // An item's fileID is pinned at first sight and must never change while
+    // the kernel still holds the item — including across renames. Recomputing
+    // it from the item's CURRENT path (as `attributes(for:)` does) makes the
+    // fileID of a temp file renamed over an existing name flip between
+    // operations, which desyncs the kernel's object identity for that vnode.
+    private func attributes(of item: ExfuseItem) throws -> FSItem.Attributes {
+        let attrs = try attributes(for: item.path)
+        attrs.fileID = item.id
+        return attrs
+    }
+
+    // Directory enumeration must report the same fileID a lookup of the entry
+    // would: prefer the registered (pinned) item identity over the path hash.
+    private func pinRegisteredID(onto attrs: FSItem.Attributes, path: String) {
+        itemsLock.withLock {
+            if let existing = itemsByPath[normalizePath(path)] {
+                attrs.fileID = existing.id
+            }
+        }
     }
 
     private func item(for path: String) throws -> ExfuseItem {

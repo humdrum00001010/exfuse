@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- Fix FSKit item identity across rename-over-existing: `getattr`/`setattr`/`readdir` now report the pinned item ID instead of recomputing it from the current path, so a temp file renamed over an existing name keeps one consistent object identity.
+- Add wire client socket timeouts so a backend that accepts but never replies (protocol skew, wedged listener) fails bounded with ETIMEDOUT instead of blocking extension threads forever.
+- Reuse a fixed pool of wire connections per volume instead of dialing one ephemeral localhost connection per filesystem callback.
+- Reply framed ENOSYS/EIO errors to unsupported or unrecognizable wire packets on the TCP transport instead of leaving the client waiting on a reply that never comes.
+
 ## 0.1.1 - 2026-07-12
 
 - Add the native FSKit backend for macOS and retain the Rust FUSE port for non-macOS systems.

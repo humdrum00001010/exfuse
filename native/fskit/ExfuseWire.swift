@@ -40,9 +40,31 @@ struct ExfuseAttr {
     let mtime: UInt64?
 }
 
+private final class ExfuseWireConnection {
+    let lock = NSLock()
+    var descriptor: Int32 = -1
+
+    func invalidate() {
+        if descriptor >= 0 {
+            Darwin.close(descriptor)
+            descriptor = -1
+        }
+    }
+
+    deinit {
+        invalidate()
+    }
+}
+
 final class ExfuseWireClient {
+    // FSKit may invoke operations concurrently. A small fixed pool preserves
+    // that parallelism while reusing localhost connections instead of putting
+    // one ephemeral client port into TIME_WAIT for every filesystem callback.
+    private static let connectionPoolSize = 16
     private let idLock = NSLock()
     private var nextRequestID: UInt64 = 1
+    private var nextConnection = 0
+    private let connections = (0..<connectionPoolSize).map { _ in ExfuseWireConnection() }
     private let port: UInt16
 
     init(port: UInt16) {
@@ -216,9 +238,7 @@ final class ExfuseWireClient {
     }
 
     private func request(_ request: ExfuseRequest, payload: Data) throws -> Data {
-        let requestID = allocateRequestID()
-        let socketFD = try connect()
-        defer { close(socketFD) }
+        let (requestID, connection) = allocateRequest()
 
         var frame = Data()
         frame.appendUInt32(exfuseMagic)
@@ -231,8 +251,23 @@ final class ExfuseWireClient {
         frame.appendUInt32(0)
         frame.append(payload)
 
-        try writeFrame(frame, to: socketFD)
-        let response = try readFrame(from: socketFD)
+        connection.lock.lock()
+        defer { connection.lock.unlock() }
+
+        let response: Data
+        do {
+            if connection.descriptor < 0 {
+                connection.descriptor = try connect()
+            }
+            try writeFrame(frame, to: connection.descriptor)
+            response = try readFrame(from: connection.descriptor)
+        } catch {
+            // Do not retry here: a stateful operation may have reached the
+            // backend before the connection failed. The next callback will
+            // reconnect this pool slot safely.
+            connection.invalidate()
+            throw error
+        }
 
         guard response.count >= 24,
               response.readUInt32(at: 0) == exfuseMagic,
@@ -240,6 +275,7 @@ final class ExfuseWireClient {
               response.readUInt32(at: 8) == request.rawValue,
               response.readUInt64(at: 12) == requestID
         else {
+            connection.invalidate()
             throw posixError(EIO)
         }
 
@@ -251,19 +287,45 @@ final class ExfuseWireClient {
         return response.subdata(in: 24..<response.count)
     }
 
-    private func allocateRequestID() -> UInt64 {
+    private func allocateRequest() -> (UInt64, ExfuseWireConnection) {
         idLock.lock()
         defer { idLock.unlock() }
-        let value = nextRequestID
+
+        let requestID = nextRequestID
         nextRequestID &+= 1
-        return value
+        let connection = connections[nextConnection]
+        nextConnection = (nextConnection + 1) % connections.count
+        return (requestID, connection)
     }
+
+    // A backend that accepts the connection but never replies (protocol-skewed
+    // host, wedged listener) must fail bounded and loud, not block this thread
+    // forever while the kernel turns the stall into EIO/EINVAL after its own
+    // deadline. Generous enough for heavy projection renders.
+    private static let receiveTimeout = timeval(tv_sec: 30, tv_usec: 0)
+    private static let sendTimeout = timeval(tv_sec: 10, tv_usec: 0)
 
     private func connect() throws -> Int32 {
         let socketFD = socket(AF_INET, SOCK_STREAM, 0)
         guard socketFD >= 0 else {
             throw posixError(errno)
         }
+
+        var receiveTimeout = Self.receiveTimeout
+        _ = setsockopt(
+            socketFD, SOL_SOCKET, SO_RCVTIMEO,
+            &receiveTimeout, socklen_t(MemoryLayout<timeval>.size)
+        )
+        var sendTimeout = Self.sendTimeout
+        _ = setsockopt(
+            socketFD, SOL_SOCKET, SO_SNDTIMEO,
+            &sendTimeout, socklen_t(MemoryLayout<timeval>.size)
+        )
+        var noSigPipe: Int32 = 1
+        _ = setsockopt(
+            socketFD, SOL_SOCKET, SO_NOSIGPIPE,
+            &noSigPipe, socklen_t(MemoryLayout<Int32>.size)
+        )
 
         var addr = sockaddr_in()
         addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
@@ -299,8 +361,7 @@ final class ExfuseWireClient {
             while written < buffer.count {
                 let result = Darwin.write(fd, base.advanced(by: written), buffer.count - written)
                 if result <= 0 {
-                    let code = errno
-                    throw posixError(code == 0 ? EIO : code)
+                    throw ioError(errno)
                 }
                 written += result
             }
@@ -327,8 +388,7 @@ final class ExfuseWireClient {
             while readCount < count {
                 let result = Darwin.read(fd, base.advanced(by: readCount), count - readCount)
                 if result <= 0 {
-                    let code = errno
-                    throw posixError(code == 0 ? EIO : code)
+                    throw ioError(errno)
                 }
                 readCount += result
             }
@@ -336,6 +396,18 @@ final class ExfuseWireClient {
         return data
     }
 
+    // SO_RCVTIMEO/SO_SNDTIMEO expirations surface as EAGAIN; report them as
+    // ETIMEDOUT so a silent backend is distinguishable from flow control.
+    private func ioError(_ code: Int32) -> any Error {
+        switch code {
+        case EAGAIN, EWOULDBLOCK:
+            return posixError(ETIMEDOUT)
+        case 0:
+            return posixError(EIO)
+        default:
+            return posixError(code)
+        }
+    }
 }
 
 extension Data {

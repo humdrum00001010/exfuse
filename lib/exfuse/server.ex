@@ -779,13 +779,34 @@ defmodule Exfuse.Server do
       when code >= @request_readdir and code <= @request_fsync ->
         route_request(state, code, request_id, data, {:genserver_client, from})
 
-      _legacy ->
+      # v2-framed but outside the supported operation range (a newer client
+      # talking to this server): answer ENOSYS instead of leaving the wire
+      # client blocked on a reply that will never come.
+      <<@magiccookie::size(32), @protocol_v2::size(32), code::size(32), request_id::size(64),
+        _data::binary>> ->
+        {:reply, error_response(code, request_id, 38), state}
+
+      <<@magiccookie::size(32), code::size(32), _data::binary>>
+      when code >= @request_readdir and code <= @request_fsync ->
         state = %{state | reply_to: {:genserver_client, from}}
 
         case handle_info({state.port, {:data, packet}}, state) do
           {:noreply, state} -> {:noreply, %{state | reply_to: nil}}
           {:stop, reason, state} -> {:stop, reason, %{state | reply_to: nil}}
         end
+
+      # Unrecognizable wire packet (protocol skew, garbage): a transport
+      # client is waiting synchronously, so reply an EIO-framed error rather
+      # than hanging its connection thread forever. The mismatch is loud in
+      # the log either way.
+      _unrecognized ->
+        log_error(
+          "replying EIO to unrecognizable wire packet (#{byte_size(packet)} bytes) " <>
+            "for #{state.mount_point}; protocol skew between the FSKit extension " <>
+            "and this exfuse version?"
+        )
+
+        {:reply, error_response(0, 0, 5), state}
     end
   end
 

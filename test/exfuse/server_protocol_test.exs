@@ -26,6 +26,15 @@ defmodule Exfuse.ServerProtocolTest do
     def exfuse_init(_mount_point, state), do: {:ok, state}
   end
 
+  defmodule PersistentWireFs do
+    @behaviour Exfuse.Fs
+    import Exfuse.Fs.Dsl, only: [file: 1]
+
+    def exfuse_init(_mount_point, state), do: {:ok, state}
+    def handle_event(:getattr, _event, socket), do: {:reply, file(size: 7), socket}
+    def handle_event(:readdir, _event, socket), do: {:reply, ["entry"], socket}
+  end
+
   defmodule ConcurrentFs do
     alias Exfuse.Socket
 
@@ -123,6 +132,60 @@ defmodule Exfuse.ServerProtocolTest do
 
     assert {_mount, ConcurrentFs, %{writes: [{"/after", "ok"}]}, nil} =
              Exfuse.Server.status(pid)
+  end
+
+  test "one persistent FSKit connection carries thousands of metadata callbacks" do
+    mount_point =
+      Path.join(System.tmp_dir!(), "exfuse-persistent-wire-#{System.unique_integer([:positive])}")
+
+    File.mkdir_p!(mount_point)
+    on_exit(fn -> File.rm_rf(mount_point) end)
+    wire_port = free_port()
+
+    _pid =
+      start_supervised!(%{
+        id: {Exfuse.Server, mount_point},
+        start:
+          {Exfuse.Server, :start_link,
+           [
+             mount_point,
+             PersistentWireFs,
+             :state,
+             [backend: :fskit, wire_port: wire_port, max_concurrency: 8]
+           ]}
+      })
+
+    assert {:ok, socket} =
+             :gen_tcp.connect({127, 0, 0, 1}, wire_port, [:binary, packet: 4, active: false])
+
+    on_exit(fn -> :gen_tcp.close(socket) end)
+    assert {:ok, {_address, client_port}} = :inet.sockname(socket)
+
+    Enum.each(1..6_000, fn request_id ->
+      {code, payload} =
+        if rem(request_id, 2) == 0,
+          do: {@request_getattr, ctx() <> "/entry"},
+          else: {@request_readdir, ctx() <> "/"}
+
+      request =
+        <<@magiccookie::32, 0x7632_0002::32, code::32, request_id::64, payload::binary>>
+
+      assert :ok = :gen_tcp.send(socket, request)
+
+      assert {:ok,
+              <<@magiccookie::32, 0x7632_0002::32, ^code::32, ^request_id::64, 0::32,
+                _response::binary>>} = :gen_tcp.recv(socket, 0, 5_000)
+    end)
+
+    assert {:ok, {_address, ^client_port}} = :inet.sockname(socket)
+  end
+
+  test "native FSKit wire client keeps a bounded persistent connection pool" do
+    source = File.read!(Path.expand("../../native/fskit/ExfuseWire.swift", __DIR__))
+
+    assert source =~ "connectionPoolSize = 16"
+    assert source =~ "connection.descriptor = try connect()"
+    refute source =~ "defer { close(socketFD) }"
   end
 
   test "server default backend is FSKit on macOS" do
@@ -263,6 +326,40 @@ defmodule Exfuse.ServerProtocolTest do
 
     assert state.fs_state == :seen
     assert_receive {^ref, <<@magiccookie::32, @request_read::32, 0::32, "ctx">>}
+  end
+
+  test "replies ENOSYS to v2-framed packets with an unsupported operation code" do
+    port = open_echo_port()
+    on_exit(fn -> close_port(port) end)
+
+    request = <<@magiccookie::32, 0x7632_0002::32, 99::32, 7::64, ctx()::binary, "/">>
+    ref = make_ref()
+
+    assert {:reply, response, _state} =
+             Exfuse.Server.handle_call(
+               {:wire_packet, request},
+               {self(), ref},
+               server_state(ReadOnlyFs, port)
+             )
+
+    assert response == <<@magiccookie::32, 0x7632_0002::32, 99::32, 7::64, 38::32>>
+  end
+
+  test "replies EIO to unrecognizable wire packets instead of hanging the client" do
+    port = open_echo_port()
+    on_exit(fn -> close_port(port) end)
+
+    request = <<@magiccookie::32, 0xDEADBEEF::32, "garbage">>
+    ref = make_ref()
+
+    assert {:reply, response, _state} =
+             Exfuse.Server.handle_call(
+               {:wire_packet, request},
+               {self(), ref},
+               server_state(ReadOnlyFs, port)
+             )
+
+    assert response == <<@magiccookie::32, 0x7632_0002::32, 0::32, 0::64, 5::32>>
   end
 
   test "umount stops duplicate FSKit backend servers for the same mount point" do
