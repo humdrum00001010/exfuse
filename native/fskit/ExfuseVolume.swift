@@ -55,7 +55,11 @@ extension ExfuseVolume: FSVolume.PathConfOperations {
 extension ExfuseVolume: FSVolume.Operations {
     var supportedVolumeCapabilities: FSVolume.SupportedCapabilities {
         let capabilities = FSVolume.SupportedCapabilities()
-        capabilities.supportsPersistentObjectIDs = true
+        // The backend identifies entries by path and cannot look them up again by
+        // object ID after an unmount. Advertising persistent IDs makes FSKit keep
+        // the overwritten destination vnode's cached pages across temp-file
+        // rename, including a zero-filled tail when the replacement grows.
+        capabilities.supportsPersistentObjectIDs = false
         capabilities.supportsSymbolicLinks = true
         capabilities.supports64BitObjectIDs = true
         capabilities.doesNotSupportVolumeSizes = true
