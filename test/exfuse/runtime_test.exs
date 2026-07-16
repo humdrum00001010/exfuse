@@ -119,7 +119,9 @@ defmodule Exfuse.RuntimeTest do
     assert {:error, {:already_mounted, ^mount}} =
              Exfuse.mount(fs, mount_point, Keyword.put(options, :wire_port, free_port()))
 
-    assert :ok = Exfuse.unmount(mount)
+    assert :ok = Exfuse.unmount(mount_point)
+    refute Process.alive?(mount)
+
     assert :ok = Exfuse.unmount(mount)
   end
 
@@ -130,6 +132,8 @@ defmodule Exfuse.RuntimeTest do
 
     refute Exfuse.mounted?(path)
     refute Exfuse.serving?(path)
+    assert :ok = Exfuse.unmount(path)
+    assert Elixir.File.dir?(path)
   end
 
   defp free_port do

@@ -25,14 +25,27 @@ defmodule Exfuse do
     end
   end
 
+  @doc """
+  Unmount a managed mount, or force-detach a mount point by path.
+
+  The path form cleans an OS-level FUSE/FSKit mount even when its owning VM has
+  exited and `list/0` is empty. The PID form remains idempotent.
+  """
+  @spec unmount(pid() | String.t()) :: :ok
   def unmount(mount) when is_pid(mount) do
     %{mount_point: mount_point} = Exfuse.Mount.status(mount)
-    detach_native(mount_point)
-    stop_mount(mount)
-    :ok
+    unmount(mount_point)
   catch
     :exit, {:noproc, _} -> :ok
     :exit, :normal -> :ok
+  end
+
+  def unmount(mount_point) when is_binary(mount_point) do
+    mount_point = Path.expand(mount_point)
+    detach_native(mount_point)
+    mount_point |> mounts_at() |> Enum.each(fn {mount, _status} -> stop_mount(mount) end)
+
+    :ok
   end
 
   @doc "Whether the path is present in the operating system mount table."
@@ -87,10 +100,15 @@ defmodule Exfuse do
 
   defp heal_mount_point(mount_point) do
     if Registry.lookup(Exfuse.Registry, {:mount, mount_point}) == [] and mounted?(mount_point) do
-      force_clean_leaf(mount_point)
+      unmount(mount_point)
     end
 
     :ok
+  end
+
+  defp mounts_at(mount_point) do
+    list()
+    |> Enum.filter(fn {_mount, status} -> status.mount_point == mount_point end)
   end
 
   defp verify_mount(mount_point, options) do
