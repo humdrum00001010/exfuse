@@ -6,7 +6,7 @@ defmodule Exfuse.RuntimeTest do
   defmodule ConcurrentFs do
     @behaviour Exfuse.Fs
 
-    def exfuse_init(owner), do: {:ok, %{owner: owner, writes: 0}}
+    def exfuse_init(owner), do: {:ok, %{owner: owner, writes: 0, buffers: %{}}}
 
     def handle_event(:read, %{token: token}, socket) do
       send(socket.state.owner, {:read_started, token, self()})
@@ -21,6 +21,29 @@ defmodule Exfuse.RuntimeTest do
           next = Socket.put_state(socket, %{socket.state | writes: socket.state.writes + 1})
           {:reply, socket.state.writes, next}
       end
+    end
+
+    def handle_event(
+          :write,
+          %{handle: handle, offset: offset, data: data},
+          socket
+        ) do
+      current = Map.get(socket.state.buffers, handle, "")
+      next_buffer = splice(current, offset, data)
+
+      send(
+        socket.state.owner,
+        {:offset_write_seen, handle, offset, byte_size(current), self()}
+      )
+
+      next =
+        Socket.put_state(socket, %{
+          socket.state
+          | writes: socket.state.writes + 1,
+            buffers: Map.put(socket.state.buffers, handle, next_buffer)
+        })
+
+      {:reply, byte_size(data), next}
     end
 
     def handle_event(:getattr, %{token: token}, socket) do
@@ -38,6 +61,27 @@ defmodule Exfuse.RuntimeTest do
     end
 
     def handle_event(_operation, _event, socket), do: {:error, :enoent, socket}
+
+    defp splice(buffer, offset, data) do
+      size = byte_size(buffer)
+
+      cond do
+        offset == size ->
+          buffer <> data
+
+        offset < size ->
+          head = binary_part(buffer, 0, offset)
+          tail_start = offset + byte_size(data)
+
+          tail =
+            if tail_start < size, do: binary_part(buffer, tail_start, size - tail_start), else: ""
+
+          head <> data <> tail
+
+        true ->
+          buffer <> :binary.copy(<<0>>, offset - size) <> data
+      end
+    end
   end
 
   setup do
@@ -85,6 +129,40 @@ defmodule Exfuse.RuntimeTest do
     assert_receive {:write_started, :b, 1, b}
     send(b, {:release, :b})
     assert {:reply, 1, _} = Task.await(second)
+  end
+
+  test "offset writes preserve one socket state and isolate backend handles", %{root_file: file} do
+    writes = [
+      %{handle: 71, offset: 0, data: "AAAA", path: "/projection"},
+      %{handle: 71, offset: 8, data: "CCCC", path: "/projection"},
+      %{handle: 72, offset: 0, data: "other", path: "/projection"},
+      %{handle: 71, offset: 4, data: "BBBB", path: "/projection"}
+    ]
+
+    results =
+      writes
+      |> Enum.map(fn event -> Task.async(fn -> File.dispatch(file, :write, event) end) end)
+      |> Enum.map(&Task.await/1)
+
+    assert Enum.sort(Enum.map(results, fn {:reply, written, _socket} -> written end)) == [
+             4,
+             4,
+             4,
+             5
+           ]
+
+    callback_pids =
+      for _ <- writes do
+        assert_receive {:offset_write_seen, _handle, _offset, _prior_size, callback_pid}
+        callback_pid
+      end
+
+    assert callback_pids |> MapSet.new() |> MapSet.size() == length(writes)
+
+    snapshot = File.snapshot(file)
+    assert snapshot.state.writes == length(writes)
+    assert snapshot.state.buffers[71] == "AAAABBBBCCCC"
+    assert snapshot.state.buffers[72] == "other"
   end
 
   test "conflicting stateful reads retry in order instead of returning EIO", %{root_file: file} do

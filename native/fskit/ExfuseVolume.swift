@@ -114,28 +114,30 @@ extension ExfuseVolume: FSVolume.Operations {
     ) async throws -> FSItem.Attributes {
         let item = try liveItem(item)
 
-        if newAttributes.isValid(.size) {
-            try client.truncate(path: item.path, size: newAttributes.size)
-            newAttributes.consumedAttributes.insert(.size)
-        }
-
-        if newAttributes.isValid(.mode) {
-            try client.chmod(path: item.path, mode: newAttributes.mode)
-            newAttributes.consumedAttributes.insert(.mode)
-        }
-
-        if newAttributes.isValid(.uid) || newAttributes.isValid(.gid) {
-            try client.chown(
-                path: item.path,
-                uid: newAttributes.isValid(.uid) ? newAttributes.uid : UInt32.max,
-                gid: newAttributes.isValid(.gid) ? newAttributes.gid : UInt32.max
-            )
-
-            if newAttributes.isValid(.uid) {
-                newAttributes.consumedAttributes.insert(.uid)
+        try item.withBackendHandle { path, _handle in
+            if newAttributes.isValid(.size) {
+                try client.truncate(path: path, size: newAttributes.size)
+                newAttributes.consumedAttributes.insert(.size)
             }
-            if newAttributes.isValid(.gid) {
-                newAttributes.consumedAttributes.insert(.gid)
+
+            if newAttributes.isValid(.mode) {
+                try client.chmod(path: path, mode: newAttributes.mode)
+                newAttributes.consumedAttributes.insert(.mode)
+            }
+
+            if newAttributes.isValid(.uid) || newAttributes.isValid(.gid) {
+                try client.chown(
+                    path: path,
+                    uid: newAttributes.isValid(.uid) ? newAttributes.uid : UInt32.max,
+                    gid: newAttributes.isValid(.gid) ? newAttributes.gid : UInt32.max
+                )
+
+                if newAttributes.isValid(.uid) {
+                    newAttributes.consumedAttributes.insert(.uid)
+                }
+                if newAttributes.isValid(.gid) {
+                    newAttributes.consumedAttributes.insert(.gid)
+                }
             }
         }
 
@@ -183,17 +185,29 @@ extension ExfuseVolume: FSVolume.Operations {
 
         let path = try childPath(directory: directory, name: name)
         let mode = newAttributes.isValid(.mode) ? newAttributes.mode : UInt32(0o644)
+        let createdHandle: UInt64?
 
         switch type {
         case .directory:
             try client.mkdir(path: path, mode: mode)
+            createdHandle = nil
         case .file:
-            _ = try client.create(path: path, mode: mode, flags: UInt32(O_CREAT | O_RDWR))
+            createdHandle = try client.create(
+                path: path,
+                mode: mode,
+                flags: UInt32(O_CREAT | O_RDWR)
+            )
         default:
             throw posixError(ENOTSUP)
         }
 
-        return (try item(for: path), fileName(for: path))
+        let createdItem = try item(for: path)
+
+        if type == .file {
+            createdItem.adoptCreatedBackendHandle(createdHandle, modes: [.read, .write])
+        }
+
+        return (createdItem, fileName(for: path))
     }
 
     func createSymbolicLink(
@@ -452,7 +466,9 @@ extension ExfuseVolume: FSVolume.OpenCloseOperations {
 
         log.notice("open \(item.path, privacy: .public)")
         do {
-            _ = try client.open(path: item.path, flags: UInt32(modes.rawValue))
+            try item.openBackend(modes: modes) { path, flags in
+                try client.open(path: path, flags: flags)
+            }
         } catch {
             log.error("open failed for \(item.path, privacy: .public): \(String(describing: error), privacy: .public)")
             throw error
@@ -467,7 +483,9 @@ extension ExfuseVolume: FSVolume.OpenCloseOperations {
             return
         }
 
-        try client.release(path: item.path, flags: UInt32(modes.rawValue))
+        try item.closeBackend(keeping: modes) { path, flags, handle in
+            try client.release(path: path, flags: flags, handle: handle)
+        }
     }
 }
 
@@ -483,11 +501,14 @@ extension ExfuseVolume: FSVolume.ReadWriteOperations {
         log.notice("read \(item.path, privacy: .public) at \(offset) length \(length)")
         let data: Data
         do {
-            data = try client.read(
-                path: item.path,
-                offset: UInt64(max(offset, 0)),
-                size: UInt64(length)
-            )
+            data = try item.withBackendHandle { path, handle in
+                try client.read(
+                    path: path,
+                    handle: handle,
+                    offset: UInt64(max(offset, 0)),
+                    size: UInt64(length)
+                )
+            }
         } catch {
             log.error(
                 "read failed for \(item.path, privacy: .public) at \(offset) length \(length): \(String(describing: error), privacy: .public)"
@@ -509,6 +530,13 @@ extension ExfuseVolume: FSVolume.ReadWriteOperations {
     func write(contents: Data, to item: FSItem, at offset: off_t) async throws -> Int {
         let item = try liveItem(item)
 
-        return try client.write(path: item.path, offset: UInt64(max(offset, 0)), data: contents)
+        return try item.withBackendHandle { path, handle in
+            try client.write(
+                path: path,
+                handle: handle,
+                offset: UInt64(max(offset, 0)),
+                data: contents
+            )
+        }
     }
 }
