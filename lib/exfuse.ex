@@ -1,4 +1,6 @@
 defmodule Exfuse do
+  alias Exfuse.Command
+
   @moduledoc "Filesystem runtime and native mount API."
 
   @busy_retries 12
@@ -56,7 +58,7 @@ defmodule Exfuse do
   @doc "Whether the mounted path answers an external directory read."
   def serving?(mount_point) when is_binary(mount_point) do
     mounted?(mount_point) and
-      match?({_output, 0}, run_command("ls", [mount_point], 2_000))
+      match?({_output, 0}, Command.run("ls", [mount_point], 2_000))
   rescue
     _ -> false
   catch
@@ -170,7 +172,7 @@ defmodule Exfuse do
     timeout = Keyword.get(options, :mount_timeout, @mount_timeout)
     args = ["-F", "-t", "exfuse", resource, mount_point]
 
-    case run_command(command, args, timeout) do
+    case Command.run(command, args, timeout) do
       {_output, 0} ->
         :ok
 
@@ -235,17 +237,17 @@ defmodule Exfuse do
 
   defp run_unmount(path, force?) do
     args = if force?, do: ["-f", path], else: [path]
-    _ = run_command("umount", args, 5_000)
+    _ = Command.run("umount", args, 5_000)
 
     if force? and :os.type() == {:unix, :darwin} and mounted?(path) do
-      _ = run_command("diskutil", ["unmount", "force", path], 5_000)
+      _ = Command.run("diskutil", ["unmount", "force", path], 5_000)
     end
 
     :ok
   end
 
   defp any_mounted?(candidates) do
-    case run_command("mount", [], 2_000) do
+    case Command.run("mount", [], 2_000) do
       {mounts, 0} -> Enum.any?(candidates, &String.contains?(mounts, " on #{&1} "))
       _ -> false
     end
@@ -269,60 +271,6 @@ defmodule Exfuse do
     :ok
   catch
     :exit, _ -> :ok
-  end
-
-  defp run_command(command, args, timeout) do
-    executable =
-      case Path.type(command) do
-        :absolute -> command
-        _ -> System.find_executable(command) || command
-      end
-
-    port =
-      Port.open({:spawn_executable, executable}, [
-        :binary,
-        :exit_status,
-        :stderr_to_stdout,
-        {:args, args}
-      ])
-
-    collect_command(port, [], System.monotonic_time(:millisecond) + timeout)
-  rescue
-    error -> {:error, Exception.message(error)}
-  catch
-    kind, reason -> {:error, {kind, reason}}
-  end
-
-  defp collect_command(port, chunks, deadline) do
-    remaining = max(deadline - System.monotonic_time(:millisecond), 0)
-
-    receive do
-      {^port, {:data, data}} ->
-        collect_command(port, [data | chunks], deadline)
-
-      {^port, {:exit_status, status}} ->
-        {chunks |> Enum.reverse() |> IO.iodata_to_binary(), status}
-    after
-      remaining ->
-        close_command(port)
-        {:timeout, chunks |> Enum.reverse() |> IO.iodata_to_binary()}
-    end
-  end
-
-  defp close_command(port) do
-    case Port.info(port, :os_pid) do
-      {:os_pid, pid} ->
-        _ = System.cmd("kill", [Integer.to_string(pid)], stderr_to_stdout: true)
-
-      _ ->
-        :ok
-    end
-
-    Port.close(port)
-  rescue
-    ArgumentError -> :ok
-  catch
-    :error, :badarg -> :ok
   end
 
   defp available_wire_port! do
