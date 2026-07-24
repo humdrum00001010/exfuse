@@ -20,7 +20,11 @@ defmodule Exfuse.Fs.Supervisor do
   def init({module, init_arg, options}) do
     files = {:via, Registry, {Exfuse.Registry, {:files, self()}}}
     mounts = {:via, Registry, {Exfuse.Registry, {:mounts, self()}}}
-    runtime_options = Keyword.put(options, :file_supervisor, files)
+
+    runtime_options =
+      options
+      |> Keyword.put(:file_supervisor, files)
+      |> Keyword.put(:filesystem, self())
 
     children = [
       %{

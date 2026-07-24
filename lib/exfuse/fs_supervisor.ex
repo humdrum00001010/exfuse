@@ -19,6 +19,8 @@ defmodule Exfuse.FsSupervisor do
   end
 
   def stop_fs(fs) do
+    notify_stop(fs)
+
     case DynamicSupervisor.terminate_child(__MODULE__, fs) do
       :ok -> :ok
       {:error, :not_found} -> :ok
@@ -26,4 +28,12 @@ defmodule Exfuse.FsSupervisor do
   end
 
   def filesystems, do: DynamicSupervisor.which_children(__MODULE__)
+
+  defp notify_stop(fs) do
+    fs
+    |> Exfuse.Fs.Supervisor.runtime()
+    |> Exfuse.Fs.Runtime.notify_stop()
+  catch
+    :exit, _reason -> :ok
+  end
 end

@@ -170,8 +170,9 @@ defmodule Exfuse.File do
     end
   end
 
-  defp complete_request(state, %{kind: :write, from: from}, result) do
+  defp complete_request(state, %{kind: :write, from: from} = request, result) do
     socket = result_socket(result)
+    maybe_publish(request, result, socket)
     GenServer.reply(from, result)
     %{state | socket: socket}
   end
@@ -208,6 +209,37 @@ defmodule Exfuse.File do
 
   defp clear_writer(reference, reference), do: nil
   defp clear_writer(writer, _reference), do: writer
+
+  defp maybe_publish(%{operation: operation, event: event}, result, socket)
+       when operation in [:write, :create, :truncate, :unlink, :rename, :mkdir, :rmdir] do
+    case result do
+      {:error, _reason, _socket} ->
+        :ok
+
+      _success ->
+        operation
+        |> mutation_events(event)
+        |> Enum.each(fn {path, actions} ->
+          Exfuse.Fs.Runtime.publish_mutation(socket.runtime.owner, path, actions)
+        end)
+    end
+  end
+
+  defp maybe_publish(_request, _result, _socket), do: :ok
+
+  defp mutation_events(:create, event), do: [{event.path, [:created, :modified]}]
+  defp mutation_events(:mkdir, event), do: [{event.path, [:created]}]
+  defp mutation_events(:unlink, event), do: [{event.path, [:removed]}]
+  defp mutation_events(:rmdir, event), do: [{event.path, [:removed]}]
+
+  defp mutation_events(:rename, event) do
+    [
+      {event.path, [:removed, :renamed]},
+      {event.target, [:created, :modified, :renamed]}
+    ]
+  end
+
+  defp mutation_events(_operation, event), do: [{event.path, [:modified]}]
 
   defp retry_as_writer(state, request) do
     request = request |> Map.drop([:base_socket, :pid]) |> Map.put(:kind, :write)

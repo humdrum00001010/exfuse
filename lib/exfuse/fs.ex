@@ -136,6 +136,13 @@ defmodule Exfuse.Fs do
 
   def request(_fs, _operation, _event), do: {:error, :invalid_request}
 
+  @spec subscribe(pid()) :: :ok
+  def subscribe(fs) when is_pid(fs) do
+    fs
+    |> Exfuse.Fs.Supervisor.runtime()
+    |> Exfuse.Fs.Runtime.subscribe(self())
+  end
+
   @spec list(pid(), String.t()) :: {:ok, [Entry.t()]} | {:error, term()}
   def list(fs, path \\ "/") do
     with {:ok, canonical} <- FsPath.canonical(path),
