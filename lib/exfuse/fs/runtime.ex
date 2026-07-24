@@ -6,6 +6,9 @@ defmodule Exfuse.Fs.Runtime do
 
   alias Exfuse.{File, FileSupervisor, Socket}
 
+  @watcher_ready_timeout 2_000
+  @watcher_probe_interval 25
+
   defstruct module: nil,
             init_arg: nil,
             options: [],
@@ -17,6 +20,7 @@ defmodule Exfuse.Fs.Runtime do
             root_state: nil,
             watcher: nil,
             watcher_ref: nil,
+            watcher_probe_dir: nil,
             watcher_error: nil,
             mounts: MapSet.new(),
             subscribers: %{}
@@ -64,14 +68,14 @@ defmodule Exfuse.Fs.Runtime do
         :ets.insert(files, {:root, root})
         root_state = root |> File.snapshot() |> Map.fetch!(:state)
 
-        {watcher, watcher_ref, watcher_error} =
+        {watcher, watcher_ref, watcher_probe_dir, watcher_error} =
           case start_watcher(module, root_state, watcher_supervisor) do
-            {:ok, watcher, reference} ->
-              {watcher, reference, nil}
+            {:ok, watcher, reference, probe_dir} ->
+              {watcher, reference, probe_dir, nil}
 
             {:error, reason} ->
               Logger.warning("Exfuse filesystem watcher start failed", reason: inspect(reason))
-              {nil, nil, reason}
+              {nil, nil, nil, reason}
           end
 
         {:ok,
@@ -87,6 +91,7 @@ defmodule Exfuse.Fs.Runtime do
            root_state: root_state,
            watcher: watcher,
            watcher_ref: watcher_ref,
+           watcher_probe_dir: watcher_probe_dir,
            watcher_error: watcher_error
          }}
 
@@ -204,7 +209,16 @@ defmodule Exfuse.Fs.Runtime do
       ) do
     notify_subscribers_stopped(state)
 
-    state = %{state | watcher: nil, watcher_ref: nil, watcher_error: reason}
+    Elixir.File.rm_rf(state.watcher_probe_dir)
+
+    state = %{
+      state
+      | watcher: nil,
+        watcher_ref: nil,
+        watcher_probe_dir: nil,
+        watcher_error: reason
+    }
+
     {:noreply, restart_watcher(state)}
   end
 
@@ -265,36 +279,97 @@ defmodule Exfuse.Fs.Runtime do
     if function_exported?(module, :watcher, 1) do
       case module.watcher(root_state) do
         {:ok, options} ->
-          spec = %{
-            id: FileSystem,
-            start: {FileSystem, :start_link, [options]},
-            restart: :temporary
-          }
+          start_file_system_watcher(options, watcher_supervisor)
 
-          case DynamicSupervisor.start_child(watcher_supervisor, spec) do
-            {:ok, watcher} ->
-              case FileSystem.subscribe(watcher) do
+        :none ->
+          {:ok, nil, nil, nil}
+      end
+    else
+      {:ok, nil, nil, nil}
+    end
+  end
+
+  defp start_file_system_watcher(options, watcher_supervisor) do
+    probe_dir = watcher_probe_dir()
+
+    with :ok <- Elixir.File.mkdir_p(probe_dir),
+         {:ok, options} <- add_probe_dir(options, probe_dir) do
+      spec = %{
+        id: FileSystem,
+        start: {FileSystem, :start_link, [options]},
+        restart: :temporary
+      }
+
+      case DynamicSupervisor.start_child(watcher_supervisor, spec) do
+        {:ok, watcher} ->
+          case FileSystem.subscribe(watcher) do
+            :ok ->
+              case await_watcher(watcher, probe_dir) do
                 :ok ->
-                  {:ok, watcher, Process.monitor(watcher)}
+                  {:ok, watcher, Process.monitor(watcher), probe_dir}
 
                 {:error, reason} ->
-                  DynamicSupervisor.terminate_child(watcher_supervisor, watcher)
+                  stop_file_system_watcher(watcher_supervisor, watcher, probe_dir)
                   {:error, reason}
               end
 
-            :ignore ->
-              {:error, :watcher_ignored}
-
             {:error, reason} ->
+              stop_file_system_watcher(watcher_supervisor, watcher, probe_dir)
               {:error, reason}
           end
 
-        :none ->
-          {:ok, nil, nil}
+        :ignore ->
+          Elixir.File.rm_rf(probe_dir)
+          {:error, :watcher_ignored}
+
+        {:error, reason} ->
+          Elixir.File.rm_rf(probe_dir)
+          {:error, reason}
       end
     else
-      {:ok, nil, nil}
+      {:error, reason} ->
+        Elixir.File.rm_rf(probe_dir)
+        {:error, reason}
     end
+  end
+
+  defp add_probe_dir(options, probe_dir) do
+    case Keyword.fetch(options, :dirs) do
+      {:ok, dirs} when is_list(dirs) ->
+        {:ok, Keyword.put(options, :dirs, dirs ++ [probe_dir])}
+
+      _other ->
+        {:error, :missing_watcher_dirs}
+    end
+  end
+
+  defp await_watcher(watcher, probe_dir) do
+    probe = Path.join(probe_dir, "ready")
+    deadline = System.monotonic_time(:millisecond) + @watcher_ready_timeout
+    await_watcher(watcher, probe, deadline, 0)
+  end
+
+  defp await_watcher(watcher, probe, deadline, attempt) do
+    Elixir.File.write!(probe, Integer.to_string(attempt))
+    remaining = deadline - System.monotonic_time(:millisecond)
+
+    if remaining <= 0 do
+      {:error, :watcher_not_ready}
+    else
+      receive do
+        {:file_event, ^watcher, {^probe, _actions}} ->
+          Elixir.File.rm(probe)
+          :ok
+      after
+        min(remaining, @watcher_probe_interval) ->
+          await_watcher(watcher, probe, deadline, attempt + 1)
+      end
+    end
+  end
+
+  defp watcher_probe_dir do
+    suffix = System.unique_integer([:positive, :monotonic])
+    Path.join(System.tmp_dir!(), "exfuse-watcher-probe-#{suffix}")
   end
 
   defp sync_result({:noreply, %Socket{}}, root_socket), do: {:noreply, root_socket}
@@ -318,18 +393,37 @@ defmodule Exfuse.Fs.Runtime do
   defp stop_watcher(state) do
     Process.demonitor(state.watcher_ref, [:flush])
     _ = DynamicSupervisor.terminate_child(state.watcher_supervisor, state.watcher)
-    %{state | watcher: nil, watcher_ref: nil}
+    Elixir.File.rm_rf(state.watcher_probe_dir)
+
+    %{
+      state
+      | watcher: nil,
+        watcher_ref: nil,
+        watcher_probe_dir: nil
+    }
   end
 
   defp restart_watcher(state) do
     case start_watcher(state.module, state.root_state, state.watcher_supervisor) do
-      {:ok, watcher, reference} ->
-        %{state | watcher: watcher, watcher_ref: reference, watcher_error: nil}
+      {:ok, watcher, reference, probe_dir} ->
+        %{
+          state
+          | watcher: watcher,
+            watcher_ref: reference,
+            watcher_probe_dir: probe_dir,
+            watcher_error: nil
+        }
 
       {:error, reason} ->
         Logger.warning("Exfuse filesystem watcher restart failed", reason: inspect(reason))
         %{state | watcher: nil, watcher_ref: nil, watcher_error: reason}
     end
+  end
+
+  defp stop_file_system_watcher(watcher_supervisor, watcher, probe_dir) do
+    _ = DynamicSupervisor.terminate_child(watcher_supervisor, watcher)
+    Elixir.File.rm_rf(probe_dir)
+    :ok
   end
 
   defp safe_stop(pid) do

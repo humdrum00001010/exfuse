@@ -17,7 +17,7 @@ defmodule Exfuse.Fs.Real do
   end
 
   @impl true
-  def watcher(%{root: root}), do: {:ok, dirs: [root]}
+  def watcher(%{root: root}), do: {:ok, dirs: [root], latency: 0}
 
   @impl true
   def event_path(%{root: root, exclude: exclude}, host_path) do
