@@ -211,7 +211,7 @@ defmodule Exfuse.Fs.Runtime do
       ) do
     notify_subscribers_stopped(state)
 
-    Elixir.File.rm_rf(state.watcher_probe_dir)
+    remove_probe_dir(state.watcher_probe_dir)
 
     state = %{
       state
@@ -293,6 +293,7 @@ defmodule Exfuse.Fs.Runtime do
 
   defp start_file_system_watcher(options, watcher_supervisor) do
     probe_dir = watcher_probe_dir()
+    {ready_timeout, options} = Keyword.pop(options, :ready_timeout, @watcher_ready_timeout)
 
     with :ok <- Elixir.File.mkdir_p(probe_dir),
          {:ok, options} <- add_probe_dir(options, probe_dir) do
@@ -306,13 +307,17 @@ defmodule Exfuse.Fs.Runtime do
         {:ok, watcher} ->
           case FileSystem.subscribe(watcher) do
             :ok ->
-              case await_watcher(watcher, probe_dir) do
+              case await_watcher(watcher, probe_dir, ready_timeout) do
                 :ok ->
                   {:ok, watcher, Process.monitor(watcher), probe_dir}
 
-                {:error, reason} ->
-                  stop_file_system_watcher(watcher_supervisor, watcher, probe_dir)
-                  {:error, reason}
+                {:error, :watcher_not_ready} ->
+                  Logger.warning(
+                    "Exfuse filesystem watcher readiness timed out; keeping watcher active"
+                  )
+
+                  Elixir.File.rm_rf(probe_dir)
+                  {:ok, watcher, Process.monitor(watcher), nil}
               end
 
             {:error, reason} ->
@@ -345,9 +350,9 @@ defmodule Exfuse.Fs.Runtime do
     end
   end
 
-  defp await_watcher(watcher, probe_dir) do
+  defp await_watcher(watcher, probe_dir, timeout) do
     probe = Path.join(probe_dir, "ready")
-    deadline = System.monotonic_time(:millisecond) + @watcher_ready_timeout
+    deadline = System.monotonic_time(:millisecond) + timeout
     await_watcher(watcher, probe, deadline, 0)
   end
 
@@ -395,7 +400,7 @@ defmodule Exfuse.Fs.Runtime do
   defp stop_watcher(state) do
     Process.demonitor(state.watcher_ref, [:flush])
     _ = DynamicSupervisor.terminate_child(state.watcher_supervisor, state.watcher)
-    Elixir.File.rm_rf(state.watcher_probe_dir)
+    remove_probe_dir(state.watcher_probe_dir)
 
     %{
       state
@@ -427,6 +432,9 @@ defmodule Exfuse.Fs.Runtime do
     Elixir.File.rm_rf(probe_dir)
     :ok
   end
+
+  defp remove_probe_dir(path) when is_binary(path), do: Elixir.File.rm_rf(path)
+  defp remove_probe_dir(_path), do: :ok
 
   defp safe_stop(pid) do
     if Process.alive?(pid), do: GenServer.stop(pid, :normal, 5_000)

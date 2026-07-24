@@ -24,6 +24,19 @@ defmodule Exfuse.FsRealWatcherTest do
       do: Exfuse.Fs.Real.event_path(state, host_path)
   end
 
+  defmodule ReadinessTimeoutFs do
+    @behaviour Exfuse.Fs
+
+    defdelegate exfuse_init(opts), to: Exfuse.Fs.Real
+    defdelegate handle_event(operation, event, socket), to: Exfuse.Fs.Real
+    defdelegate event_path(state, host_path), to: Exfuse.Fs.Real
+
+    def watcher(state) do
+      {:ok, options} = Exfuse.Fs.Real.watcher(state)
+      {:ok, Keyword.put(options, :ready_timeout, 0)}
+    end
+  end
+
   test "an external host write reaches direct subscribers with a relative path" do
     root = tmp_root()
     {:ok, fs} = Exfuse.start_fs(Exfuse.Fs.Real, root: root)
@@ -101,6 +114,25 @@ defmodule Exfuse.FsRealWatcherTest do
 
     assert log =~ "Not able to start file_system worker"
     assert log =~ "Exfuse filesystem watcher restart failed"
+  end
+
+  test "a readiness timeout keeps the native watcher alive" do
+    root = tmp_root()
+    owner = self()
+
+    log =
+      capture_log(fn ->
+        send(owner, {:readiness_timeout_fs, Exfuse.start_fs(ReadinessTimeoutFs, root: root)})
+      end)
+
+    assert_receive {:readiness_timeout_fs, {:ok, fs}}
+    on_exit(fn -> Exfuse.stop_fs(fs) end)
+
+    assert %{watcher: watcher, watcher_error: nil} = Exfuse.Fs.Supervisor.status(fs)
+    assert is_pid(watcher)
+    assert Process.alive?(watcher)
+    assert log =~ "watcher readiness timed out"
+    refute log =~ "unknown option"
   end
 
   defp tmp_root do
