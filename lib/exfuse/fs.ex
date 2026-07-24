@@ -257,6 +257,10 @@ defmodule Exfuse.Fs do
   @callback exfuse_init(term) :: {:ok, term} | {:error, term}
 
   @callback handle_event(operation, event, Exfuse.Socket.t()) :: event_result
+  @callback watcher(term()) :: {:ok, keyword()} | :none
+  @callback event_path(term(), String.t()) :: {:ok, String.t()} | :ignore
+
+  @optional_callbacks watcher: 1, event_path: 2
 
   defp atomic_write(fs, path, bytes) do
     with {:ok, path} <- FsPath.canonical(path) do

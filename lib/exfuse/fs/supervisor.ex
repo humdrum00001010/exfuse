@@ -6,12 +6,15 @@ defmodule Exfuse.Fs.Supervisor do
   alias Exfuse.{FileSupervisor, MountSupervisor}
 
   def start_link(module, init_arg, options) do
-    Supervisor.start_link(__MODULE__, {module, init_arg, options})
+    {name, options} = Keyword.pop(options, :name)
+    start_options = if name, do: [name: name], else: []
+    Supervisor.start_link(__MODULE__, {module, init_arg, options}, start_options)
   end
 
   def runtime(fs), do: child(fs, :runtime)
   def file_supervisor(fs), do: child(fs, :files)
   def mount_supervisor(fs), do: child(fs, :mounts)
+  def watcher_supervisor(fs), do: child(fs, :watchers)
 
   def root(fs), do: fs |> runtime() |> Exfuse.Fs.Runtime.root()
   def status(fs), do: fs |> runtime() |> Exfuse.Fs.Runtime.status()
@@ -20,10 +23,12 @@ defmodule Exfuse.Fs.Supervisor do
   def init({module, init_arg, options}) do
     files = {:via, Registry, {Exfuse.Registry, {:files, self()}}}
     mounts = {:via, Registry, {Exfuse.Registry, {:mounts, self()}}}
+    watchers = {:via, Registry, {Exfuse.Registry, {:watchers, self()}}}
 
     runtime_options =
       options
       |> Keyword.put(:file_supervisor, files)
+      |> Keyword.put(:watcher_supervisor, watchers)
       |> Keyword.put(:filesystem, self())
 
     children = [
@@ -35,6 +40,11 @@ defmodule Exfuse.Fs.Supervisor do
       %{
         id: :mounts,
         start: {MountSupervisor, :start_link, [[name: mounts]]},
+        type: :supervisor
+      },
+      %{
+        id: :watchers,
+        start: {DynamicSupervisor, :start_link, [[strategy: :one_for_one, name: watchers]]},
         type: :supervisor
       },
       %{

@@ -29,6 +29,7 @@ defmodule Exfuse.MixProject do
 
   defp deps do
     [
+      {:file_system, "~> 1.1"},
       {:ex_doc, "~> 0.40.3", only: :dev, runtime: false}
     ]
   end

@@ -17,6 +17,24 @@ defmodule Exfuse.Fs.Real do
   end
 
   @impl true
+  def watcher(%{root: root}), do: {:ok, dirs: [root]}
+
+  @impl true
+  def event_path(%{root: root, exclude: exclude}, host_path) do
+    host_path = Path.expand(host_path)
+    relative = Path.relative_to(host_path, root)
+    segments = Path.split(relative)
+
+    cond do
+      relative == host_path -> :ignore
+      relative == "." -> :ignore
+      String.starts_with?(relative, "../") -> :ignore
+      Enum.any?(segments, &MapSet.member?(exclude, &1)) -> :ignore
+      true -> Fs.Path.canonical(relative)
+    end
+  end
+
+  @impl true
   def handle_event(:readdir, %{path: path}, socket) do
     with {:ok, host} <- host_path(socket.state, path),
          {:ok, names} <- File.ls(host) do

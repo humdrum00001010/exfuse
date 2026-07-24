@@ -12,6 +12,11 @@ defmodule Exfuse do
     Exfuse.FsSupervisor.start_fs(module, init_arg, options)
   end
 
+  def ensure_fs(module, init_arg, options) when is_atom(module) and is_list(options) do
+    key = Keyword.fetch!(options, :key)
+    Exfuse.FsSupervisor.ensure_fs(key, module, init_arg, Keyword.delete(options, :key))
+  end
+
   def stop_fs(fs) when is_pid(fs), do: Exfuse.FsSupervisor.stop_fs(fs)
 
   def mount(fs, mount_point, options \\ []) when is_pid(fs) and is_binary(mount_point) do

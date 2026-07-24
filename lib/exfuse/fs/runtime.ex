@@ -2,6 +2,7 @@ defmodule Exfuse.Fs.Runtime do
   @moduledoc false
 
   use GenServer
+  require Logger
 
   alias Exfuse.{File, FileSupervisor, Socket}
 
@@ -10,9 +11,13 @@ defmodule Exfuse.Fs.Runtime do
             options: [],
             filesystem: nil,
             file_supervisor: nil,
+            watcher_supervisor: nil,
             files: nil,
             root: nil,
+            root_state: nil,
             watcher: nil,
+            watcher_ref: nil,
+            watcher_error: nil,
             mounts: MapSet.new(),
             subscribers: %{}
 
@@ -50,12 +55,24 @@ defmodule Exfuse.Fs.Runtime do
   def init({module, init_arg, options}) do
     files = :ets.new(__MODULE__, [:set, :protected, read_concurrency: true])
     file_supervisor = Keyword.fetch!(options, :file_supervisor)
+    watcher_supervisor = Keyword.fetch!(options, :watcher_supervisor)
     runtime = %{owner: self(), files: files, file_supervisor: file_supervisor}
 
     case start_file(:root, module, init_arg, runtime, options) do
       {:ok, root} ->
         Process.monitor(root)
         :ets.insert(files, {:root, root})
+        root_state = root |> File.snapshot() |> Map.fetch!(:state)
+
+        {watcher, watcher_ref, watcher_error} =
+          case start_watcher(module, root_state, watcher_supervisor) do
+            {:ok, watcher, reference} ->
+              {watcher, reference, nil}
+
+            {:error, reason} ->
+              Logger.warning("Exfuse filesystem watcher start failed", reason: inspect(reason))
+              {nil, nil, reason}
+          end
 
         {:ok,
          %__MODULE__{
@@ -64,8 +81,13 @@ defmodule Exfuse.Fs.Runtime do
            options: options,
            filesystem: Keyword.fetch!(options, :filesystem),
            file_supervisor: file_supervisor,
+           watcher_supervisor: watcher_supervisor,
            files: files,
-           root: root
+           root: root,
+           root_state: root_state,
+           watcher: watcher,
+           watcher_ref: watcher_ref,
+           watcher_error: watcher_error
          }}
 
       {:error, reason} ->
@@ -86,6 +108,7 @@ defmodule Exfuse.Fs.Runtime do
       files: files,
       mounts: state.mounts,
       watcher: state.watcher,
+      watcher_error: state.watcher_error,
       subscribers: Map.values(state.subscribers)
     }
 
@@ -112,6 +135,7 @@ defmodule Exfuse.Fs.Runtime do
   def handle_call(:notify_stop, _from, state) do
     notify_subscribers_stopped(state)
     Enum.each(Map.keys(state.subscribers), &Process.demonitor(&1, [:flush]))
+    state = stop_watcher(state)
     {:reply, :ok, %{state | subscribers: %{}}}
   end
 
@@ -155,6 +179,35 @@ defmodule Exfuse.Fs.Runtime do
   end
 
   @impl true
+  def handle_info(
+        {:file_event, watcher, {host_path, actions}},
+        %{watcher: watcher} = state
+      ) do
+    case state.module.event_path(state.root_state, host_path) do
+      {:ok, path} ->
+        broadcast(state, path, actions)
+        {:noreply, state}
+
+      :ignore ->
+        {:noreply, state}
+    end
+  end
+
+  def handle_info({:file_event, watcher, :stop}, %{watcher: watcher} = state) do
+    notify_subscribers_stopped(state)
+    {:noreply, state |> stop_watcher() |> restart_watcher()}
+  end
+
+  def handle_info(
+        {:DOWN, reference, :process, watcher, reason},
+        %{watcher: watcher, watcher_ref: reference} = state
+      ) do
+    notify_subscribers_stopped(state)
+
+    state = %{state | watcher: nil, watcher_ref: nil, watcher_error: reason}
+    {:noreply, restart_watcher(state)}
+  end
+
   def handle_info({:DOWN, reference, :process, pid, _reason}, state) do
     subscribers = Map.delete(state.subscribers, reference)
     mounts = MapSet.delete(state.mounts, pid)
@@ -171,6 +224,7 @@ defmodule Exfuse.Fs.Runtime do
   @impl true
   def terminate(_reason, state) do
     notify_subscribers_stopped(state)
+    stop_watcher(state)
 
     Enum.each(state.mounts, &Exfuse.unmount/1)
 
@@ -207,6 +261,42 @@ defmodule Exfuse.Fs.Runtime do
     )
   end
 
+  defp start_watcher(module, root_state, watcher_supervisor) do
+    if function_exported?(module, :watcher, 1) do
+      case module.watcher(root_state) do
+        {:ok, options} ->
+          spec = %{
+            id: FileSystem,
+            start: {FileSystem, :start_link, [options]},
+            restart: :temporary
+          }
+
+          case DynamicSupervisor.start_child(watcher_supervisor, spec) do
+            {:ok, watcher} ->
+              case FileSystem.subscribe(watcher) do
+                :ok ->
+                  {:ok, watcher, Process.monitor(watcher)}
+
+                {:error, reason} ->
+                  DynamicSupervisor.terminate_child(watcher_supervisor, watcher)
+                  {:error, reason}
+              end
+
+            :ignore ->
+              {:error, :watcher_ignored}
+
+            {:error, reason} ->
+              {:error, reason}
+          end
+
+        :none ->
+          {:ok, nil, nil}
+      end
+    else
+      {:ok, nil, nil}
+    end
+  end
+
   defp sync_result({:noreply, %Socket{}}, root_socket), do: {:noreply, root_socket}
   defp sync_result({:reply, value, %Socket{}}, root_socket), do: {:reply, value, root_socket}
   defp sync_result({:error, reason, %Socket{}}, root_socket), do: {:error, reason, root_socket}
@@ -221,6 +311,25 @@ defmodule Exfuse.Fs.Runtime do
     Enum.each(state.subscribers, fn {_ref, subscriber} ->
       send(subscriber, {:file_event, state.filesystem, :stop})
     end)
+  end
+
+  defp stop_watcher(%{watcher: nil} = state), do: state
+
+  defp stop_watcher(state) do
+    Process.demonitor(state.watcher_ref, [:flush])
+    _ = DynamicSupervisor.terminate_child(state.watcher_supervisor, state.watcher)
+    %{state | watcher: nil, watcher_ref: nil}
+  end
+
+  defp restart_watcher(state) do
+    case start_watcher(state.module, state.root_state, state.watcher_supervisor) do
+      {:ok, watcher, reference} ->
+        %{state | watcher: watcher, watcher_ref: reference, watcher_error: nil}
+
+      {:error, reason} ->
+        Logger.warning("Exfuse filesystem watcher restart failed", reason: inspect(reason))
+        %{state | watcher: nil, watcher_ref: nil, watcher_error: reason}
+    end
   end
 
   defp safe_stop(pid) do
