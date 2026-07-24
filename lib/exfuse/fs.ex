@@ -86,6 +86,7 @@ defmodule Exfuse.Fs do
   """
 
   alias Exfuse.File
+  alias Exfuse.Fs.{Entry, Stat}
   alias Exfuse.Fs.Path, as: FsPath
 
   @operations [
@@ -135,6 +136,75 @@ defmodule Exfuse.Fs do
 
   def request(_fs, _operation, _event), do: {:error, :invalid_request}
 
+  @spec list(pid(), String.t()) :: {:ok, [Entry.t()]} | {:error, term()}
+  def list(fs, path \\ "/") do
+    with {:ok, canonical} <- FsPath.canonical(path),
+         {:ok, entries} <- request(fs, :readdir, %{path: canonical}) do
+      {:ok,
+       Enum.map(entries, fn {name, attrs} ->
+         stat = stat_from_attrs(attrs)
+
+         %Entry{
+           name: name,
+           path: child_path(canonical, name),
+           type: stat.type,
+           size: stat.size
+         }
+       end)}
+    end
+  end
+
+  @spec stat(pid(), String.t()) :: {:ok, Stat.t()} | {:error, term()}
+  def stat(fs, path) do
+    with {:ok, attrs} <- request(fs, :getattr, %{path: path}) do
+      {:ok, stat_from_attrs(attrs)}
+    end
+  end
+
+  @spec readlink(pid(), String.t()) :: {:ok, String.t()} | {:error, term()}
+  def readlink(fs, path), do: request(fs, :readlink, %{path: path})
+
+  @spec read(pid(), String.t()) :: {:ok, binary()} | {:error, term()}
+  def read(fs, path) do
+    with {:ok, %Stat{size: size}} <- stat(fs, path) do
+      request(fs, :read, %{path: path, offset: 0, size: size, flags: 0, handle: 0})
+    end
+  end
+
+  @spec write(pid(), String.t(), binary(), keyword()) :: :ok | {:error, term()}
+  def write(fs, path, bytes, opts \\ []) when is_binary(bytes) do
+    if Keyword.get(opts, :atomic, true) do
+      atomic_write(fs, path, bytes)
+    else
+      direct_write(fs, path, bytes)
+    end
+  end
+
+  @spec mkdir(pid(), String.t()) :: :ok | {:error, term()}
+  def mkdir(fs, path),
+    do: request(fs, :mkdir, %{path: path, mode: 0o755}) |> success()
+
+  @spec remove(pid(), String.t()) :: :ok | {:error, term()}
+  def remove(fs, path) do
+    case stat(fs, path) do
+      {:ok, %Stat{type: :directory}} ->
+        request(fs, :rmdir, %{path: path}) |> success()
+
+      {:ok, %Stat{}} ->
+        request(fs, :unlink, %{path: path}) |> success()
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  @spec rename(pid(), String.t(), String.t()) :: :ok | {:error, term()}
+  def rename(fs, source, target) do
+    with {:ok, target} <- FsPath.canonical(target) do
+      request(fs, :rename, %{path: source, target: target}) |> success()
+    end
+  end
+
   @type operation ::
           :readdir
           | :getattr
@@ -180,6 +250,94 @@ defmodule Exfuse.Fs do
   @callback exfuse_init(term) :: {:ok, term} | {:error, term}
 
   @callback handle_event(operation, event, Exfuse.Socket.t()) :: event_result
+
+  defp atomic_write(fs, path, bytes) do
+    with {:ok, path} <- FsPath.canonical(path) do
+      temp = temporary_path(path)
+
+      case request(fs, :create, %{path: temp, mode: 0o644, flags: 0}) do
+        {:ok, handle} ->
+          case write_and_close(fs, temp, handle, bytes, flush?: true) do
+            :ok ->
+              case rename(fs, temp, path) do
+                :ok -> :ok
+                {:error, _reason} = error -> cleanup_temp(fs, temp, error)
+              end
+
+            {:error, _reason} = error ->
+              cleanup_temp(fs, temp, error)
+          end
+
+        {:error, _reason} = error ->
+          error
+      end
+    end
+  end
+
+  defp direct_write(fs, path, bytes) do
+    with {:ok, handle} <- request(fs, :create, %{path: path, mode: 0o644, flags: 0}) do
+      write_and_close(fs, path, handle, bytes, flush?: false)
+    end
+  end
+
+  defp write_and_close(fs, path, handle, bytes, opts) do
+    write_result =
+      with {:ok, written} <-
+             request(fs, :write, %{path: path, handle: handle, offset: 0, data: bytes}),
+           true <- written == byte_size(bytes),
+           :ok <- maybe_flush(fs, path, handle, Keyword.fetch!(opts, :flush?)) do
+        :ok
+      else
+        false -> {:error, :short_write}
+        {:error, _reason} = error -> error
+      end
+
+    release_result =
+      fs
+      |> request(:release, %{path: path, handle: handle, flags: 0})
+      |> success()
+
+    case {write_result, release_result} do
+      {:ok, :ok} -> :ok
+      {{:error, _reason} = error, _release} -> error
+      {:ok, {:error, _reason} = error} -> error
+    end
+  end
+
+  defp maybe_flush(_fs, _path, _handle, false), do: :ok
+
+  defp maybe_flush(fs, path, handle, true),
+    do: request(fs, :flush, %{path: path, handle: handle, flags: 0}) |> success()
+
+  defp cleanup_temp(fs, temp, original_error) do
+    _ = remove(fs, temp)
+    original_error
+  end
+
+  defp temporary_path(path) do
+    parent = Path.dirname(path)
+    base = Path.basename(path)
+    suffix = System.unique_integer([:positive, :monotonic])
+    child_path(parent, ".#{base}.tmp-#{suffix}")
+  end
+
+  defp success(:ok), do: :ok
+  defp success({:ok, _value}), do: :ok
+  defp success({:error, _reason} = error), do: error
+
+  defp stat_from_attrs({mode, type, size}),
+    do: %Stat{mode: mode, type: entry_type(type), size: size}
+
+  defp stat_from_attrs({mode, type, size, mtime}),
+    do: %Stat{mode: mode, type: entry_type(type), size: size, mtime: mtime}
+
+  defp entry_type(1), do: :directory
+  defp entry_type(2), do: :file
+  defp entry_type(3), do: :symlink
+  defp entry_type(_), do: :other
+
+  defp child_path("/", name), do: "/" <> name
+  defp child_path(parent, name), do: parent <> "/" <> name
 
   defp behaviour_setup do
     quote do
