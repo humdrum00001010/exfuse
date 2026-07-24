@@ -203,6 +203,8 @@ defmodule Exfuse.Fs.Runtime do
     {:noreply, state |> stop_watcher() |> restart_watcher()}
   end
 
+  def handle_info({:file_event, _stale_watcher, _payload}, state), do: {:noreply, state}
+
   def handle_info(
         {:DOWN, reference, :process, watcher, reason},
         %{watcher: watcher, watcher_ref: reference} = state

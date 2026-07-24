@@ -94,6 +94,11 @@ defmodule Exfuse.FsRealWatcherTest do
     assert status.watcher == nil
     assert status.watcher_error == :watcher_ignored
     assert {:ok, []} = Exfuse.Fs.list(fs, "/")
+
+    send(runtime, {:file_event, first, {Path.join(root, "late-probe"), [:created]}})
+    _ = :sys.get_state(runtime)
+    assert {:ok, []} = Exfuse.Fs.list(fs, "/")
+
     assert log =~ "Not able to start file_system worker"
     assert log =~ "Exfuse filesystem watcher restart failed"
   end
