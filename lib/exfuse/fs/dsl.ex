@@ -158,6 +158,7 @@ defmodule Exfuse.Fs.Dsl do
   def errno(:enospc), do: 28
   def errno(:erofs), do: 30
   def errno(:enosys), do: 38
+  def errno(:enotempty), do: 39
   def errno(code) when is_integer(code), do: code
 
   def reason(code) when is_integer(code), do: Map.get(@errno_reasons, code, code)

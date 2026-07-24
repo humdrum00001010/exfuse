@@ -111,7 +111,7 @@ defmodule Exfuse.File do
   end
 
   defp initialize(module, init_arg) do
-    if function_exported?(module, :exfuse_init, 1) do
+    if Code.ensure_loaded?(module) and function_exported?(module, :exfuse_init, 1) do
       case module.exfuse_init(init_arg) do
         {:ok, state} -> {:ok, state}
         {:error, _reason} = error -> error
