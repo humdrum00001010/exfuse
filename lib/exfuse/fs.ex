@@ -85,6 +85,29 @@ defmodule Exfuse.Fs do
       end
   """
 
+  alias Exfuse.File
+  alias Exfuse.Fs.Path, as: FsPath
+
+  @operations [
+    :readdir,
+    :getattr,
+    :readlink,
+    :read,
+    :write,
+    :open,
+    :create,
+    :truncate,
+    :unlink,
+    :rename,
+    :mkdir,
+    :rmdir,
+    :chmod,
+    :chown,
+    :flush,
+    :release,
+    :fsync
+  ]
+
   defmacro __using__(opts) do
     attribs_only? = Keyword.get(opts, :attribs, false)
 
@@ -96,6 +119,21 @@ defmodule Exfuse.Fs do
 
   @doc "Builds an attribute reply for `getattr` or `readdir`."
   defdelegate attr(opts), to: Exfuse.Fs.Dsl
+
+  @spec request(pid(), operation(), map()) :: {:ok, term()} | :ok | {:error, term()}
+  def request(fs, operation, %{path: path} = event)
+      when is_pid(fs) and operation in @operations do
+    with {:ok, path} <- FsPath.canonical(path),
+         {:ok, root} <- Exfuse.Fs.Supervisor.root(fs) do
+      case File.dispatch(root, operation, Map.put(event, :path, path)) do
+        {:reply, value, _socket} -> {:ok, value}
+        {:noreply, _socket} -> :ok
+        {:error, reason, _socket} -> {:error, Exfuse.Fs.Dsl.reason(reason)}
+      end
+    end
+  end
+
+  def request(_fs, _operation, _event), do: {:error, :invalid_request}
 
   @type operation ::
           :readdir

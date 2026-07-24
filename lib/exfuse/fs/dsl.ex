@@ -21,6 +21,24 @@ defmodule Exfuse.Fs.Dsl do
     :fsync
   ]
   @error_noent 2
+  @errno_reasons %{
+    1 => :eperm,
+    2 => :enoent,
+    5 => :eio,
+    7 => :e2big,
+    9 => :ebadf,
+    11 => :eagain,
+    13 => :eacces,
+    16 => :ebusy,
+    17 => :eexist,
+    20 => :enotdir,
+    21 => :eisdir,
+    22 => :einval,
+    28 => :enospc,
+    30 => :erofs,
+    38 => :enosys,
+    39 => :enotempty
+  }
   @attr_dir 1
   @attr_file 2
   @attr_symlink 3
@@ -141,6 +159,9 @@ defmodule Exfuse.Fs.Dsl do
   def errno(:erofs), do: 30
   def errno(:enosys), do: 38
   def errno(code) when is_integer(code), do: code
+
+  def reason(code) when is_integer(code), do: Map.get(@errno_reasons, code, code)
+  def reason(reason), do: reason
 
   defp route(caller, op, path, block) when op in @ops do
     route = parse_route!(path, caller)
