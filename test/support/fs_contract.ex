@@ -21,6 +21,12 @@ defmodule Exfuse.Test.FsContract do
       assert {:ok, "updated"} = Exfuse.Fs.read(fs, "/docs/b.md")
       assert :ok = Exfuse.Fs.remove(fs, "/docs/b.md")
       assert :ok = Exfuse.Fs.remove(fs, "/docs")
+
+      assert :ok = Exfuse.Fs.write(fs, "/nested/deep/a.md", "nested")
+      assert {:ok, "nested"} = Exfuse.Fs.read(fs, "/nested/deep/a.md")
+      assert :ok = Exfuse.Fs.remove(fs, "/nested/deep/a.md")
+      assert :ok = Exfuse.Fs.remove(fs, "/nested/deep")
+      assert :ok = Exfuse.Fs.remove(fs, "/nested")
       assert {:ok, []} = Exfuse.Fs.list(fs, "/")
     after
       cleanup.()

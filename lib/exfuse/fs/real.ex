@@ -37,12 +37,12 @@ defmodule Exfuse.Fs.Real do
   @impl true
   def handle_event(:readdir, %{path: path}, socket) do
     with {:ok, host} <- host_path(socket.state, path),
-         {:ok, names} <- File.ls(host) do
+         {:ok, names} <- raw_list_dir(host) do
       entries =
         names
         |> Enum.reject(&MapSet.member?(socket.state.exclude, &1))
         |> Enum.flat_map(fn name ->
-          case File.lstat(Path.join(host, name), time: :posix) do
+          case raw_lstat(Path.join(host, name)) do
             {:ok, stat} -> [{name, attrs(stat)}]
             {:error, _reason} -> []
           end
@@ -57,7 +57,7 @@ defmodule Exfuse.Fs.Real do
 
   def handle_event(:getattr, %{path: path}, socket) do
     with {:ok, host} <- host_path(socket.state, path, leaf: :nofollow),
-         {:ok, stat} <- File.lstat(host, time: :posix) do
+         {:ok, stat} <- raw_lstat(host) do
       {:reply, attrs(stat), socket}
     else
       {:error, reason} -> {:error, reason, socket}
@@ -66,7 +66,7 @@ defmodule Exfuse.Fs.Real do
 
   def handle_event(:readlink, %{path: path}, socket) do
     with {:ok, host} <- host_path(socket.state, path, leaf: :nofollow),
-         {:ok, target} <- File.read_link(host) do
+         {:ok, target} <- raw_read_link(host) do
       {:reply, target, socket}
     else
       {:error, reason} -> {:error, reason, socket}
@@ -74,12 +74,16 @@ defmodule Exfuse.Fs.Real do
   end
 
   def handle_event(:read, %{path: path, offset: offset, size: size}, socket) do
-    with {:ok, host} <- host_path(socket.state, path) do
-      case File.open(host, [:read, :binary], fn io -> :file.pread(io, offset, size) end) do
-        {:ok, {:ok, bytes}} -> {:reply, bytes, socket}
-        {:ok, :eof} -> {:reply, "", socket}
-        {:ok, {:error, reason}} -> {:error, reason, socket}
-        {:error, reason} -> {:error, reason, socket}
+    with {:ok, host} <- host_path(socket.state, path),
+         {:ok, io} <- raw_open(host, [:read]) do
+      result = :file.pread(io, offset, size)
+      close_result = :file.close(io)
+
+      case {result, close_result} do
+        {{:ok, bytes}, :ok} -> {:reply, bytes, socket}
+        {:eof, :ok} -> {:reply, "", socket}
+        {{:error, reason}, _close_result} -> {:error, reason, socket}
+        {_result, {:error, reason}} -> {:error, reason, socket}
       end
     else
       {:error, reason} -> {:error, reason, socket}
@@ -88,8 +92,9 @@ defmodule Exfuse.Fs.Real do
 
   def handle_event(:create, %{path: path, mode: mode}, socket) do
     with {:ok, host} <- host_path(socket.state, path),
-         :ok <- File.write(host, "", [:binary]) do
-      case File.chmod(host, mode) do
+         {:ok, io} <- raw_open(host, [:write]),
+         :ok <- :file.close(io) do
+      case raw_chmod(host, mode) do
         :ok ->
           {handle, socket} = Socket.new_handle(socket, host)
           {:reply, handle, socket}
@@ -133,7 +138,7 @@ defmodule Exfuse.Fs.Real do
   def handle_event(:rename, %{path: source, target: target}, socket) do
     with {:ok, source} <- host_path(socket.state, source, leaf: :nofollow),
          {:ok, target} <- host_path(socket.state, target, leaf: :nofollow),
-         :ok <- File.rename(source, target) do
+         :ok <- :prim_file.rename(chars(source), chars(target)) do
       {:noreply, socket}
     else
       {:error, reason} -> {:error, reason, socket}
@@ -142,13 +147,13 @@ defmodule Exfuse.Fs.Real do
 
   def handle_event(:mkdir, %{path: path, mode: mode}, socket) do
     with {:ok, host} <- host_path(socket.state, path),
-         :ok <- File.mkdir(host) do
-      case File.chmod(host, mode) do
+         :ok <- :prim_file.make_dir(chars(host)) do
+      case raw_chmod(host, mode) do
         :ok ->
           {:noreply, socket}
 
         {:error, reason} ->
-          File.rmdir(host)
+          :prim_file.del_dir(chars(host))
           {:error, reason, socket}
       end
     else
@@ -157,10 +162,10 @@ defmodule Exfuse.Fs.Real do
   end
 
   def handle_event(:unlink, %{path: path}, socket),
-    do: host_mutation(socket, path, &File.rm/1, leaf: :nofollow)
+    do: host_mutation(socket, path, &:prim_file.delete(chars(&1)), leaf: :nofollow)
 
   def handle_event(:rmdir, %{path: path}, socket),
-    do: host_mutation(socket, path, &File.rmdir/1, leaf: :nofollow)
+    do: host_mutation(socket, path, &:prim_file.del_dir(chars(&1)), leaf: :nofollow)
 
   def handle_event(_operation, _event, socket), do: {:error, :enosys, socket}
 
@@ -195,7 +200,7 @@ defmodule Exfuse.Fs.Real do
     segments
     |> Enum.scan(root, &Path.join(&2, &1))
     |> Enum.reduce_while(:ok, fn candidate, :ok ->
-      case File.lstat(candidate) do
+      case raw_lstat(candidate) do
         {:ok, %{type: :symlink}} -> {:halt, {:error, :eacces}}
         {:ok, %{type: :directory}} -> {:cont, :ok}
         {:ok, _stat} -> {:halt, {:error, :enotdir}}
@@ -208,7 +213,7 @@ defmodule Exfuse.Fs.Real do
   defp validate_leaf(_candidate, :nofollow), do: :ok
 
   defp validate_leaf(candidate, :reject_symlink) do
-    case File.lstat(candidate) do
+    case raw_lstat(candidate) do
       {:ok, %{type: :symlink}} -> {:error, :eacces}
       {:ok, _stat} -> :ok
       {:error, :enoent} -> :ok
@@ -226,8 +231,7 @@ defmodule Exfuse.Fs.Real do
   end
 
   defp with_raw_file(path, modes, operation) do
-    with {:ok, io} <-
-           :file.open(String.to_charlist(path), [:raw, :binary | modes]) do
+    with {:ok, io} <- raw_open(path, modes) do
       operation_result = operation.(io)
       close_result = :file.close(io)
 
@@ -238,6 +242,42 @@ defmodule Exfuse.Fs.Real do
       end
     end
   end
+
+  defp raw_open(path, modes),
+    do: :file.open(chars(path), [:raw, :binary | modes])
+
+  defp raw_list_dir(path) do
+    case :prim_file.list_dir(chars(path)) do
+      {:ok, names} -> {:ok, Enum.map(names, &List.to_string/1)}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp raw_lstat(path) do
+    case :prim_file.read_link_info(chars(path), time: :posix) do
+      {:ok, info} -> {:ok, File.Stat.from_record(info)}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp raw_read_link(path) do
+    case :prim_file.read_link(chars(path)) do
+      {:ok, target} -> {:ok, List.to_string(target)}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp raw_chmod(path, mode) do
+    with {:ok, info} <- :prim_file.read_link_info(chars(path), time: :posix) do
+      current_mode = elem(info, 7)
+      permissions = Bitwise.band(mode, 0o7777)
+      mode = Bitwise.bor(Bitwise.band(current_mode, Bitwise.bnot(0o7777)), permissions)
+      info = put_elem(info, 7, mode)
+      :prim_file.write_file_info(chars(path), info, time: :posix)
+    end
+  end
+
+  defp chars(path), do: String.to_charlist(path)
 
   defp attrs(%File.Stat{type: type, mode: mode, size: size, mtime: mtime}) do
     Fs.attr(

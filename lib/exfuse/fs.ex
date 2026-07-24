@@ -180,16 +180,41 @@ defmodule Exfuse.Fs do
 
   @spec write(pid(), String.t(), binary(), keyword()) :: :ok | {:error, term()}
   def write(fs, path, bytes, opts \\ []) when is_binary(bytes) do
-    if Keyword.get(opts, :atomic, true) do
-      atomic_write(fs, path, bytes)
-    else
-      direct_write(fs, path, bytes)
+    with {:ok, path} <- FsPath.canonical(path),
+         :ok <- maybe_mkdir_parent(fs, path, opts) do
+      if Keyword.get(opts, :atomic, true) do
+        atomic_write(fs, path, bytes)
+      else
+        direct_write(fs, path, bytes)
+      end
     end
   end
 
   @spec mkdir(pid(), String.t()) :: :ok | {:error, term()}
   def mkdir(fs, path),
     do: request(fs, :mkdir, %{path: path, mode: 0o755}) |> success()
+
+  @spec mkdir_p(pid(), String.t()) :: :ok | {:error, term()}
+  def mkdir_p(fs, path) do
+    with {:ok, path} <- FsPath.canonical(path) do
+      path
+      |> String.split("/", trim: true)
+      |> Enum.reduce_while({:ok, "/"}, fn segment, {:ok, parent} ->
+        child = child_path(parent, segment)
+
+        case stat(fs, child) do
+          {:ok, %Stat{type: :directory}} -> {:cont, {:ok, child}}
+          {:ok, %Stat{}} -> {:halt, {:error, :enotdir}}
+          {:error, :enoent} -> mkdir_result(fs, child)
+          {:error, _reason} = error -> {:halt, error}
+        end
+      end)
+      |> case do
+        {:ok, _path} -> :ok
+        {:error, _reason} = error -> error
+      end
+    end
+  end
 
   @spec remove(pid(), String.t()) :: :ok | {:error, term()}
   def remove(fs, path) do
@@ -282,6 +307,18 @@ defmodule Exfuse.Fs do
         {:error, _reason} = error ->
           error
       end
+    end
+  end
+
+  defp maybe_mkdir_parent(fs, path, opts) do
+    if Keyword.get(opts, :parents, true), do: mkdir_p(fs, Path.dirname(path)), else: :ok
+  end
+
+  defp mkdir_result(fs, path) do
+    case mkdir(fs, path) do
+      :ok -> {:cont, {:ok, path}}
+      {:error, :eexist} -> {:cont, {:ok, path}}
+      {:error, _reason} = error -> {:halt, error}
     end
   end
 

@@ -42,6 +42,34 @@ defmodule Exfuse.FsRealTest do
     refute Enum.any?(entries, &(&1.name == ".ecrits"))
   end
 
+  test "application reads and atomic writes do not enter file_server_2" do
+    root = tmp_root()
+    File.write!(Path.join(root, "document.hwp"), "before")
+
+    {:ok, fs} = Exfuse.start_fs(Exfuse.Fs.Real, root: root)
+    on_exit(fn -> Exfuse.stop_fs(fs) end)
+
+    file_server = Process.whereis(:file_server_2)
+    :ok = :sys.suspend(file_server)
+
+    try do
+      task =
+        Task.async(fn ->
+          with {:ok, "before"} <- Exfuse.Fs.read(fs, "/document.hwp"),
+               :ok <- Exfuse.Fs.write(fs, "/document.hwp", "after"),
+               {:ok, "after"} <- Exfuse.Fs.read(fs, "/document.hwp") do
+            :ok
+          end
+        end)
+
+      assert :ok = Task.await(task, 1_000)
+    after
+      :ok = :sys.resume(file_server)
+    end
+
+    assert File.read!(Path.join(root, "document.hwp")) == "after"
+  end
+
   defp tmp_root do
     path =
       Path.join(
