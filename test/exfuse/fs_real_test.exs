@@ -81,6 +81,32 @@ defmodule Exfuse.FsRealTest do
     assert File.read!(Path.join(root, "document.hwp")) == "after"
   end
 
+  test "native engine bridge does not enter file_server_2" do
+    root = tmp_root()
+    path = Path.join(root, "document.hwp")
+    File.write!(path, "before")
+
+    file_server = Process.whereis(:file_server_2)
+    :ok = :sys.suspend(file_server)
+
+    try do
+      task =
+        Task.async(fn ->
+          with {:ok, "before"} <- Exfuse.Fs.Real.read_native(path),
+               :ok <- Exfuse.Fs.Real.atomic_write_native(path, "after"),
+               {:ok, "after"} <- Exfuse.Fs.Real.read_native(path) do
+            :ok
+          end
+        end)
+
+      assert :ok = Task.await(task, 1_000)
+    after
+      :ok = :sys.resume(file_server)
+    end
+
+    assert File.read!(path) == "after"
+  end
+
   defp tmp_root do
     path =
       Path.join(

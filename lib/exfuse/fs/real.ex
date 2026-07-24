@@ -18,6 +18,62 @@ defmodule Exfuse.Fs.Real do
   @impl true
   def watcher(%{root: root}), do: {:ok, dirs: [root], latency: 0}
 
+  @doc """
+  Read an already-resolved host file without entering OTP's `file_server_2`.
+
+  Native document engines use this bridge when a callback is invoked while an
+  outer mounted filesystem operation is already waiting on `file_server_2`.
+  Ordinary application code should use `Exfuse.Fs.read/2`.
+  """
+  @spec read_native(String.t()) :: {:ok, binary()} | {:error, File.posix()}
+  def read_native(path) when is_binary(path) do
+    with {:ok, io} <- raw_open(path, [:read]) do
+      result = raw_read_chunks(io, [])
+      close_result = :file.close(io)
+
+      case {result, close_result} do
+        {{:ok, bytes}, :ok} -> {:ok, bytes}
+        {{:error, _reason} = error, _close_result} -> error
+        {{:ok, _bytes}, {:error, reason}} -> {:error, reason}
+      end
+    end
+  end
+
+  @doc """
+  Atomically replace an already-resolved host file without `file_server_2`.
+
+  This is the write companion to `read_native/1` for native engine callbacks.
+  Ordinary application code should use `Exfuse.Fs.write/4`.
+  """
+  @spec atomic_write_native(String.t(), binary()) :: :ok | {:error, File.posix()}
+  def atomic_write_native(path, bytes) when is_binary(path) and is_binary(bytes) do
+    temp = temporary_native_path(path)
+
+    result =
+      with {:ok, io} <- raw_open(temp, [:write, :exclusive]) do
+        write_result =
+          with :ok <- :file.write(io, bytes),
+               :ok <- :file.sync(io) do
+            :ok
+          end
+
+        close_result = :file.close(io)
+
+        with :ok <- write_result,
+             :ok <- close_result,
+             :ok <- :prim_file.rename(chars(temp), chars(path)) do
+          :ok
+        end
+      end
+
+    if result == :ok do
+      :ok
+    else
+      _ = :prim_file.delete(chars(temp))
+      result
+    end
+  end
+
   @impl true
   def event_path(%{root: root, exclude: exclude}, host_path) do
     host_path = Path.expand(host_path)
@@ -274,6 +330,19 @@ defmodule Exfuse.Fs.Real do
       info = put_elem(info, 7, mode)
       :prim_file.write_file_info(chars(path), info, time: :posix)
     end
+  end
+
+  defp raw_read_chunks(io, chunks) do
+    case :file.read(io, 1024 * 1024) do
+      {:ok, bytes} -> raw_read_chunks(io, [bytes | chunks])
+      :eof -> {:ok, chunks |> Enum.reverse() |> IO.iodata_to_binary()}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp temporary_native_path(path) do
+    suffix = System.unique_integer([:positive, :monotonic])
+    Path.join(Path.dirname(path), ".#{Path.basename(path)}.tmp-#{suffix}")
   end
 
   defp chars(path), do: String.to_charlist(path)
