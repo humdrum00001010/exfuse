@@ -9,10 +9,9 @@ defmodule Exfuse.Fs.Real do
   def exfuse_init(opts) do
     root = opts |> Keyword.fetch!(:root) |> Path.expand()
 
-    if File.dir?(root) do
-      {:ok, %{root: root, exclude: MapSet.new(Keyword.get(opts, :exclude, []))}}
-    else
-      {:error, :enoent}
+    case File.mkdir_p(root) do
+      :ok -> {:ok, %{root: root, exclude: MapSet.new(Keyword.get(opts, :exclude, []))}}
+      {:error, reason} -> {:error, reason}
     end
   end
 

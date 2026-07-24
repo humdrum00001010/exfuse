@@ -42,6 +42,17 @@ defmodule Exfuse.FsRealTest do
     refute Enum.any?(entries, &(&1.name == ".ecrits"))
   end
 
+  test "creates a missing real root" do
+    root = Path.join(tmp_root(), "nested/workspace")
+    refute File.exists?(root)
+
+    assert {:ok, fs} = Exfuse.start_fs(Exfuse.Fs.Real, root: root)
+    on_exit(fn -> Exfuse.stop_fs(fs) end)
+
+    assert File.dir?(root)
+    assert {:ok, []} = Exfuse.Fs.list(fs)
+  end
+
   test "application reads and atomic writes do not enter file_server_2" do
     root = tmp_root()
     File.write!(Path.join(root, "document.hwp"), "before")
