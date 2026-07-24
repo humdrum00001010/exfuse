@@ -148,6 +148,7 @@ defmodule Exfuse.Fs.Dsl do
   def errno(:eperm), do: 1
   def errno(:eio), do: 5
   def errno(:e2big), do: 7
+  def errno(:ebadf), do: 9
   def errno(:eagain), do: 11
   def errno(:eacces), do: 13
   def errno(:ebusy), do: 16
