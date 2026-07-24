@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Add application-side `Exfuse.Fs` operations with canonical paths and atomic writes.
+- Add standard real directory-backed and in-memory filesystems with shared contract tests.
+- Add monitored direct filesystem subscriptions with mutation-order parity.
+- Share one restartable native host watcher per keyed Real filesystem runtime.
 - Own the full mount lifecycle: one `Mount` per mount point, orphan healing, busy retry, mount verification, and forced cleanup.
 - Add `mounted?/1` and `serving?/1` external mount-health probes.
 - Let Xcode own FSKit host and extension provisioning and signing.

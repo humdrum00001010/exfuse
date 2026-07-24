@@ -113,6 +113,81 @@ operations run in arrival order. The event map always includes `path`,
 The detailed execution and wire design is in
 [`docs/backend-neutral-filesystem-ir.md`](docs/backend-neutral-filesystem-ir.md).
 
+## Real and memory filesystems
+
+Exfuse includes a host directory-backed filesystem and an in-memory filesystem.
+Both use the same `Exfuse.Fs` application operations and direct subscription
+contract:
+
+```elixir
+root = Path.expand("/path/to/workspace")
+
+{:ok, fs} =
+  Exfuse.ensure_fs(
+    Exfuse.Fs.Real,
+    [root: root, exclude: [".metadata"]],
+    key: {:workspace, root}
+  )
+
+:ok = Exfuse.Fs.subscribe(fs)
+:ok = Exfuse.Fs.write(fs, "/notes.md", "# Notes")
+{:ok, "# Notes"} = Exfuse.Fs.read(fs, "/notes.md")
+{:ok, entries} = Exfuse.Fs.list(fs, "/")
+
+receive do
+  {:file_event, ^fs, {"/notes.md", actions}} ->
+    IO.inspect(actions)
+end
+```
+
+`ensure_fs/3` returns the existing logical filesystem when another caller uses
+the same key. A shared Real filesystem owns one native host watcher regardless
+of the number of subscribers or native mount points.
+
+Application paths are canonical root-relative slash paths. Traversal and NUL
+bytes are rejected before dispatch; Real also rejects traversal through
+symlinks and configured excluded path segments. Writes are atomic by default
+and can opt into direct replacement with `atomic: false`.
+
+The application operation API is:
+
+```elixir
+Exfuse.Fs.list(fs, "/")
+Exfuse.Fs.stat(fs, "/notes.md")
+Exfuse.Fs.readlink(fs, "/shortcut")
+Exfuse.Fs.read(fs, "/notes.md")
+Exfuse.Fs.write(fs, "/notes.md", bytes)
+Exfuse.Fs.mkdir(fs, "/docs")
+Exfuse.Fs.rename(fs, "/old", "/new")
+Exfuse.Fs.remove(fs, "/new")
+```
+
+Subscribers receive canonical logical paths:
+
+```elixir
+{:file_event, fs, {path, actions}}
+{:file_event, fs, :stop}
+```
+
+The runtime monitors subscribers, removes dead processes, restarts a stopped
+Real watcher once per stop, and exposes watcher failures through
+`Exfuse.Fs.Supervisor.status/1` without disabling filesystem operations.
+
+For deterministic tests or ephemeral data, use a distinct shared key and the
+Memory backend:
+
+```elixir
+{:ok, memory_fs} =
+  Exfuse.ensure_fs(
+    Exfuse.Fs.Memory,
+    [
+      files: %{"/README.md" => "hello"},
+      symlinks: %{"/latest" => "/README.md"}
+    ],
+    key: {:memory, :workspace_preview}
+  )
+```
+
 ## Backends
 
 The Rust port lives under `rust`. It is a Port executable, not a NIF. Set
