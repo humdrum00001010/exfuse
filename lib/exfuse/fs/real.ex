@@ -77,7 +77,29 @@ defmodule Exfuse.Fs.Real do
   @impl true
   def event_path(%{root: root, exclude: exclude}, host_path) do
     host_path = Path.expand(host_path)
-    relative = Path.relative_to(host_path, root)
+
+    # The watcher reports the OS's CANONICAL path while `root` is whatever the
+    # caller passed. On macOS those differ by a symlink several levels up
+    # (`/var` -> `/private/var`), so `Path.relative_to/2` finds no common prefix,
+    # returns `host_path` unchanged, and the `relative == host_path` arm below
+    # discarded EVERY event. Measured 2026-07-27: root `/var/folders/…/T/x`,
+    # event `/private/var/folders/…/T/x` — the live file tree never updated and
+    # the watcher tests saw an empty mailbox.
+    #
+    # Try the root as given and its resolved form; the first that yields a real
+    # relative path wins.
+    relative =
+      Enum.find_value(
+        Enum.uniq([root, resolved(root)]),
+        host_path,
+        fn candidate ->
+          case Path.relative_to(host_path, candidate) do
+            ^host_path -> nil
+            rel -> rel
+          end
+        end
+      )
+
     segments = Path.split(relative)
 
     cond do
@@ -87,6 +109,22 @@ defmodule Exfuse.Fs.Real do
       Enum.any?(segments, &MapSet.member?(exclude, &1)) -> :ignore
       true -> Fs.Path.canonical(relative)
     end
+  end
+
+  # Resolve symlinked ANCESTORS, not just the leaf: on macOS the link is `/var`,
+  # far above the directory being watched.
+  defp resolved(path) do
+    path
+    |> Path.expand()
+    |> Path.split()
+    |> Enum.reduce("/", fn segment, acc ->
+      joined = Path.join(acc, segment)
+
+      case Elixir.File.read_link(joined) do
+        {:ok, target} -> Path.expand(target, acc)
+        _not_a_link -> joined
+      end
+    end)
   end
 
   @impl true

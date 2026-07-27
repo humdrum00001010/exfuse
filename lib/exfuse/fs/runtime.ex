@@ -353,10 +353,10 @@ defmodule Exfuse.Fs.Runtime do
   defp await_watcher(watcher, probe_dir, timeout) do
     probe = Path.join(probe_dir, "ready")
     deadline = System.monotonic_time(:millisecond) + timeout
-    await_watcher(watcher, probe, deadline, 0)
+    await_watcher(watcher, probe, Path.basename(probe_dir), deadline, 0)
   end
 
-  defp await_watcher(watcher, probe, deadline, attempt) do
+  defp await_watcher(watcher, probe, probe_name, deadline, attempt) do
     Elixir.File.write!(probe, Integer.to_string(attempt))
     remaining = deadline - System.monotonic_time(:millisecond)
 
@@ -364,15 +364,41 @@ defmodule Exfuse.Fs.Runtime do
       {:error, :watcher_not_ready}
     else
       receive do
-        {:file_event, ^watcher, {^probe, _actions}} ->
-          Elixir.File.rm(probe)
-          :ok
+        {:file_event, ^watcher, {path, _actions}} ->
+          if watcher_probe_event?(path, probe_name) do
+            Elixir.File.rm(probe)
+            :ok
+          else
+            await_watcher(watcher, probe, probe_name, deadline, attempt)
+          end
       after
         min(remaining, @watcher_probe_interval) ->
-          await_watcher(watcher, probe, deadline, attempt + 1)
+          await_watcher(watcher, probe, probe_name, deadline, attempt + 1)
       end
     end
   end
+
+  # The old check pinned the exact probe FILE path and could never match on
+  # macOS, for two independent reasons measured on 2026-07-27:
+  #
+  #   expected : /var/folders/…/T/exfuse-watcher-probe-N/ready
+  #   event    : /private/var/folders/…/T/exfuse-watcher-probe-N
+  #
+  # `System.tmp_dir!/0` returns the /var symlink while the OS reports the
+  # canonical /private/var, AND the backend reports the containing DIRECTORY
+  # rather than the file. So readiness always timed out: every filesystem with a
+  # watcher paid the full 2s stall and logged "watcher readiness timed out"
+  # before carrying on with an unverified watcher.
+  #
+  # Match on the probe directory's NAME rather than its full path. The name is
+  # already unique (`exfuse-watcher-probe-<unique_integer>`), so this identifies
+  # the event unambiguously while being immune to both mismatches — the symlink
+  # (`/var` is the link, several levels above the probe, so resolving only the
+  # parent is not enough) and the backend reporting the directory.
+  defp watcher_probe_event?(path, probe_name) when is_binary(path),
+    do: String.contains?(path, probe_name)
+
+  defp watcher_probe_event?(_path, _probe_name), do: false
 
   defp watcher_probe_dir do
     suffix = System.unique_integer([:positive, :monotonic])
