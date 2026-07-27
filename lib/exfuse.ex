@@ -197,7 +197,15 @@ defmodule Exfuse do
     end
   end
 
-  defp detach_native(mount_point) do
+  @doc """
+  Detach the OS mount at `mount_point`, without touching the owning processes.
+
+  `unmount/1` also stops the `Exfuse.Mount` that owns the point, which a mount
+  cannot do from inside its own `terminate/2`. This is the bare kernel detach for
+  that case.
+  """
+  @spec detach_native(String.t()) :: :ok
+  def detach_native(mount_point) do
     candidates = mount_candidates(mount_point)
     Enum.each(candidates, &run_unmount(&1, false))
 

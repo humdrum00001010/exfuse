@@ -43,6 +43,13 @@ defmodule Exfuse.Mount do
 
   @impl true
   def init({fs, mount_point, options}) do
+    # WITHOUT THIS, `terminate/2` NEVER RUNS. A supervisor shutdown sends `:exit`,
+    # and a process that does not trap it dies immediately — so the detach below
+    # was dead code on every orderly shutdown, and the kernel mount outlived the
+    # VM every single time. Measured on a dev machine: 148 orphaned OS mounts,
+    # one of them over `$HOME/.ecrits`, shadowing a real file read-only.
+    Process.flag(:trap_exit, true)
+
     backend = Keyword.fetch!(options, :backend)
     runtime = Fs.Supervisor.runtime(fs)
 
@@ -112,6 +119,13 @@ defmodule Exfuse.Mount do
 
   @impl true
   def terminate(_reason, state) do
+    # DETACH FIRST, and before the listener/port go. The kernel mount outlives
+    # this process unless it is detached here: FSKit keeps the volume inside its
+    # own extension and nothing in the OS unmounts it when the wire disappears.
+    # Unmounting triggers flushes, so the wire has to still be able to answer
+    # them — reverse this order and the unmount hangs.
+    detach(state)
+
     if is_pid(state.listener) and Process.alive?(state.listener),
       do: GenServer.stop(state.listener)
 
@@ -119,6 +133,18 @@ defmodule Exfuse.Mount do
     Fs.Runtime.unregister_mount(state.runtime, self())
     :ok
   end
+
+  # Best effort by construction: terminate/2 must not raise, and a mount that is
+  # already gone is success, not an error.
+  defp detach(%{mount_point: mount_point}) when is_binary(mount_point) do
+    Exfuse.detach_native(mount_point)
+  rescue
+    _error -> :ok
+  catch
+    _kind, _reason -> :ok
+  end
+
+  defp detach(_state), do: :ok
 
   defp start_transport(:fskit, root, mount_point, options) do
     port = Keyword.fetch!(options, :wire_port)
