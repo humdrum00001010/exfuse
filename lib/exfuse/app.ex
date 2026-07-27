@@ -1,20 +1,11 @@
 defmodule Exfuse.App do
-  use Application
-
   @moduledoc """
-  Exfuse application callback module.
+  Port-binary path resolution.
+
+  This is NOT an application callback module any more. Exfuse's tree moved to
+  `Exfuse.Supervisor` so the HOST starts and stops it — see that module for why
+  owning its own root leaked mounts.
   """
-
-  def start(_type, _args) do
-    children = [
-      {Registry, keys: :unique, name: Exfuse.Registry},
-      Exfuse.FsSupervisor,
-      {Task.Supervisor, name: Exfuse.RequestSupervisor}
-    ]
-
-    opts = [strategy: :one_for_one, name: Exfuse.Sup]
-    Supervisor.start_link(children, opts)
-  end
 
   @doc """
   Finds the path of the port and returns `{:ok, path}` if successful.

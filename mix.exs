@@ -22,7 +22,6 @@ defmodule Exfuse.MixProject do
 
   def application do
     [
-      mod: {Exfuse.App, []},
       extra_applications: [:logger]
     ]
   end
