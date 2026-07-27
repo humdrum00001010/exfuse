@@ -1,4 +1,4 @@
-defmodule Exfuse.WireListener do
+defmodule Exfuse.Transport do
   @moduledoc """
   TCP transport for FSKit and other non-Port exfuse frontends.
 

@@ -149,7 +149,7 @@ defmodule Exfuse.Mount do
   defp start_transport(:fskit, root, mount_point, options) do
     port = Keyword.fetch!(options, :wire_port)
 
-    case Exfuse.WireListener.start_link(
+    case Exfuse.Transport.start_link(
            dispatcher: {__MODULE__, :dispatch, [root, mount_point]},
            port: port
          ) do

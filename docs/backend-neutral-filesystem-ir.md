@@ -165,7 +165,7 @@ FSKit callback
   -> checkout idle ExfuseWireConnection
   -> encode v3 request
   -> TCP packet-4
-  -> WireListener connection task
+  -> Transport connection task
   -> Wire.decode_request
   -> root File.dispatch
   -> optional plug File.dispatch
