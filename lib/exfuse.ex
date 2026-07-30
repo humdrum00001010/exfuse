@@ -266,17 +266,12 @@ defmodule Exfuse do
     end
   end
 
+  # `mount(8)` reports the fully-resolved path, so a mount point under a
+  # symlinked ancestor (`/tmp` -> `/private/tmp`) never matched and a perfectly
+  # good mount was torn down as `:mount_not_visible`.
   defp mount_candidates(mount_point) do
-    [Path.expand(mount_point), realpath(mount_point)]
-    |> Enum.reject(&is_nil/1)
+    [Path.expand(mount_point), Exfuse.Fs.Path.resolve_ancestors(mount_point)]
     |> Enum.uniq()
-  end
-
-  defp realpath(path) do
-    case :file.read_link_all(String.to_charlist(path)) do
-      {:ok, resolved} -> List.to_string(resolved)
-      {:error, _} -> nil
-    end
   end
 
   defp stop_mount(mount) do

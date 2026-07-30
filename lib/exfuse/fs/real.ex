@@ -90,7 +90,7 @@ defmodule Exfuse.Fs.Real do
     # relative path wins.
     relative =
       Enum.find_value(
-        Enum.uniq([root, resolved(root)]),
+        Enum.uniq([root, Exfuse.Fs.Path.resolve_ancestors(root)]),
         host_path,
         fn candidate ->
           case Path.relative_to(host_path, candidate) do
@@ -113,20 +113,6 @@ defmodule Exfuse.Fs.Real do
 
   # Resolve symlinked ANCESTORS, not just the leaf: on macOS the link is `/var`,
   # far above the directory being watched.
-  defp resolved(path) do
-    path
-    |> Path.expand()
-    |> Path.split()
-    |> Enum.reduce("/", fn segment, acc ->
-      joined = Path.join(acc, segment)
-
-      case Elixir.File.read_link(joined) do
-        {:ok, target} -> Path.expand(target, acc)
-        _not_a_link -> joined
-      end
-    end)
-  end
-
   @impl true
   def handle_event(:readdir, %{path: path}, socket) do
     with {:ok, host} <- host_path(socket.state, path),
